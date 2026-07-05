@@ -21,7 +21,7 @@ scripts/local-package.command
 
 ### Tests
 
-The only automated test is the quota-extractor regression in `scripts/quota-extractor-regression.swift`. It is **not** an XCTest target — it's compiled standalone with `swiftc` against a hand-picked subset of source files (see `.github/workflows/ci.yml`). To run it locally, compile `Models/ToolID.swift`, `Models/QuotaModels.swift`, `Services/CredentialStore.swift`, `Services/QuotaProvider.swift`, and the script together, then run the binary. It exits non-zero on failure and prints which assertion failed. **Add a case here whenever you touch quota parsing** — it's the safety net for the heuristic extractor and the Codex `wham/usage` parser.
+The only automated test is the quota-extractor regression in `scripts/quota-extractor-regression.swift`. It is **not** an XCTest target — it's compiled standalone with `swiftc` against a hand-picked subset of source files (see `.github/workflows/ci.yml`). To run it locally, compile `Models/ToolID.swift`, `Models/QuotaModels.swift`, `Services/CredentialStore.swift`, `Services/WarmupRunner.swift`, `Services/QuotaProvider.swift`, `Services/LocalUsageProvider.swift`, and the script together, then run the binary. It exits non-zero on failure and prints which assertion failed. **Add a case here whenever you touch quota parsing** — it's the safety net for the heuristic extractor and the Codex `wham/usage` parser.
 
 CI (`ci.yml`) runs on macOS with Xcode 16.3: regression test → Debug build → Release build.
 

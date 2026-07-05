@@ -48,6 +48,7 @@ jobs:
             Sources/QuotaWarmer/Services/CredentialStore.swift \
             Sources/QuotaWarmer/Services/WarmupRunner.swift \
             Sources/QuotaWarmer/Services/QuotaProvider.swift \
+            Sources/QuotaWarmer/Services/LocalUsageProvider.swift \
             scripts/quota-extractor-regression.swift \
             -o /tmp/quota-extractor-regression
           /tmp/quota-extractor-regression
