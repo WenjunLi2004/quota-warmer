@@ -320,6 +320,20 @@ struct QuotaSnapshot {
         return metric.remainingFraction >= 0.5
     }
 
+    /// The 5-hour window this snapshot describes has already reset, so its usage
+    /// figures are obsolete. Reached when live polling stays blocked (rate limit,
+    /// auth failure) for longer than the window itself. Callers should report the
+    /// quota as restored rather than keep showing the pre-reset percentage, which
+    /// would understate what the user actually has available.
+    ///
+    /// Distinct from mere staleness: while the reset is still ahead the numbers
+    /// remain accurate, which is why the countdown keeps running even when the
+    /// snapshot is stale. An idle window has no real reset to pass.
+    func primaryWindowRolledOver(now: Date = Date()) -> Bool {
+        guard let metric = fiveHour, !metric.isIdle, let resetAt = metric.resetAt else { return false }
+        return resetAt <= now
+    }
+
     /// True when the 5-hour window's reset says it only *just* opened (almost the
     /// whole window still remains) yet the reported quota is implausibly low.
     /// Right at a window rollover Claude's OAuth usage API briefly returns the

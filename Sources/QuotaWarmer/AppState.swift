@@ -159,6 +159,19 @@ final class ToolState: ObservableObject {
         return remaining > 0 ? remaining : nil
     }
 
+    /// The last known 5h window's reset moment has already passed, so that
+    /// window rolled over and the snapshot's usage figures describe a window
+    /// that no longer exists. Reached when live polling is blocked (rate limit,
+    /// auth) for longer than the window itself — continuing to show the old
+    /// percentage would claim the user has far less quota than they really do.
+    ///
+    /// Note this is *not* the same as a stale-but-still-valid snapshot: while
+    /// the known reset is still in the future its numbers remain correct, which
+    /// is why the menu bar keeps counting down even when the dot is yellow.
+    var primaryWindowRolledOver: Bool {
+        quotaSnapshot?.primaryWindowRolledOver() ?? false
+    }
+
     var windowProgress: Double {
         primaryMetric?.remainingFraction ?? 0
     }

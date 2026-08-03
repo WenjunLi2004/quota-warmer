@@ -690,6 +690,59 @@ struct QuotaExtractorRegression {
                 "\(viewPath) must route its Refresh control through refreshQuotaManually"
             )
         }
+        // A blocked poll must not make the menu bar lie. While the known reset is
+        // still ahead the old numbers stay valid (keep counting down even when the
+        // dot is yellow); once it passes, the window rolled over and the old
+        // percentage would badly understate the quota actually available.
+        require(
+            appStateSource.contains("quotaSnapshot?.primaryWindowRolledOver()"),
+            "ToolState must derive the rolled-over window from the snapshot"
+        )
+
+        // Behavioral coverage for the rollover rule itself: the user's screenshot
+        // showed a stale 29% long after that window had already reset.
+        let rolloverNow = Date()
+        func claudeWindow(resetOffset: TimeInterval) -> QuotaSnapshot {
+            provider.snapshot(
+                tool: .claude,
+                source: "test",
+                corroboratingSource: nil,
+                payload: [
+                    "rate_limits": [
+                        "five_hour": [
+                            "utilization": 71,
+                            "resets_at": Int(rolloverNow.addingTimeInterval(resetOffset).timeIntervalSince1970)
+                        ]
+                    ]
+                ],
+                message: nil
+            )
+        }
+        require(
+            !claudeWindow(resetOffset: 2 * 3600).primaryWindowRolledOver(now: rolloverNow),
+            "A stale snapshot whose reset is still ahead is accurate and must keep its countdown"
+        )
+        require(
+            claudeWindow(resetOffset: -60).primaryWindowRolledOver(now: rolloverNow),
+            "Once the known reset has passed the window rolled over and 29% must not be reported as current"
+        )
+        require(
+            !claudeIdle.primaryWindowRolledOver(now: rolloverNow),
+            "An idle projection has no real window to roll over"
+        )
+        let menuBarSource = readSource("Sources/QuotaWarmer/Views/MenuBarLabel.swift")
+        require(
+            menuBarSource.contains("st.primaryWindowRolledOver")
+                && menuBarSource.range(of: "primaryWindowRolledOver")!.lowerBound
+                    < menuBarSource.range(of: "Int(metric.remainingFraction * 100)")!.lowerBound,
+            "The menu bar must report a rolled-over window as restored before falling back to the stale percentage"
+        )
+        require(
+            !readSource("Sources/QuotaWarmer/Services/QuotaProvider.swift")
+                .contains("forHTTPHeaderField: \"User-Agent\""),
+            "Must not borrow the Claude Code user agent: measured 2026-08-04, it returns an ~8x longer Retry-After"
+        )
+
         // The bug the user actually hit: forcing the fetch through the backoff in
         // AppState is useless while the control that triggers it is greyed out for
         // the entire retry window, which is precisely when a retry is wanted.

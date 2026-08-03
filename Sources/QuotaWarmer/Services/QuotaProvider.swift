@@ -95,6 +95,11 @@ final class QuotaProvider: QuotaProviding {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if url.host == "api.anthropic.com", url.path == "/api/oauth/usage" {
             request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+            // Deliberately NOT identifying as `claude-code/<version>` here. Measured
+            // 2026-08-04 against this endpoint while limited: the CLI user agent
+            // returned Retry-After 3480s, the default agent 411s, in both request
+            // orders. This endpoint throttles the CLI's own polling far harder, so
+            // borrowing its identity would make our cooldowns ~8x longer.
         }
         if let accountID = credential.accountID, !accountID.isEmpty {
             request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")

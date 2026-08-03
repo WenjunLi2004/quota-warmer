@@ -50,6 +50,13 @@ enum MenuBarStatus {
                 text = "\(Int((st.primaryMetric?.remainingFraction ?? 1) * 100))%"
             } else if let r = st.timeUntilReset {
                 text = compactQuotaText(time: r, metric: st.primaryMetric)
+            } else if st.primaryWindowRolledOver {
+                // The known reset already passed while polling was blocked, so the
+                // window rolled over and quota is restored. Report that instead of
+                // the pre-reset percentage, which would badly understate what is
+                // available. Approximate ("~") because the exact figure is only
+                // knowable once a live fetch succeeds again.
+                text = "~100%"
             } else if let metric = st.primaryMetric {
                 // No live 5h countdown (window depleted/expired/rate-limited): show
                 // the 5h remaining percent only. The menu-bar label represents the
