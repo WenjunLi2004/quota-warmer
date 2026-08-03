@@ -201,8 +201,8 @@ struct QuotaMetric: Identifiable {
     let context: String
     /// The window has not actually started: its quota is full and any `resetAt`
     /// is a sliding "if you started now" projection (Codex's idle 5h window) or
-    /// simply unknown (Claude's null `five_hour` slot). Shown for context, but it
-    /// must never count as a freshly-opened window to auto-warm or claim.
+    /// synthesized from Claude's null `five_hour` slot. It is claimable by an
+    /// opted-in auto-warm, but must not count as already opened or confirmed.
     let isIdle: Bool
 
     init(
@@ -289,11 +289,10 @@ struct QuotaSnapshot {
               metric.remainingFraction >= remainingThreshold else {
             return false
         }
-        // Codex's idle window is a genuine, not-yet-started 5h window — claiming it
-        // (sending `hi` so the window actually opens) is exactly the point, so allow
-        // it. Claude's idle window is a *synthesized* projection over a null
-        // `five_hour` slot — there is no real window to claim, so never warm it.
-        if metric.isIdle && tool != .codex { return false }
+        // An idle window is exactly what auto-warm is meant to claim. Claude's
+        // metric is synthesized from a null `five_hour` slot, but sending the
+        // warm-up command opens the real window. `AutoWarmDedup` guards the full
+        // claimed duration, so the sliding idle projection cannot cause repeats.
 
         let inferredWindowStart = resetAt.addingTimeInterval(-windowDuration)
         let windowAge = now.timeIntervalSince(inferredWindowStart)
@@ -361,17 +360,22 @@ struct Credential {
 enum CredentialError: LocalizedError {
     case missing(String)
     case invalid(String)
+    case interactionRequired(String)
 
     var errorDescription: String? {
         switch self {
         case .missing(let provider): return "\(provider) credentials not found"
         case .invalid(let provider): return "\(provider) credentials are invalid"
+        case .interactionRequired(let provider): return "\(provider) credential access requires approval"
         }
     }
 }
 
 enum QuotaProviderError: LocalizedError {
     case missingCredentials(String)
+    case credentialInteractionRequired(String)
+    /// Claude Code owns refresh-token rotation. Run the CLI, then read its fresh credential.
+    case cliRefreshRequired(String)
     case authFailure(String)
     case rateLimited(String, retryAfter: TimeInterval?)
     case unavailable(String)
@@ -380,6 +384,8 @@ enum QuotaProviderError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingCredentials(let msg): return msg
+        case .credentialInteractionRequired(let msg): return msg
+        case .cliRefreshRequired(let msg): return msg
         case .authFailure(let msg): return msg
         case .rateLimited(let msg, _): return msg
         case .unavailable(let msg): return msg

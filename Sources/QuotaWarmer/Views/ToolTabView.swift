@@ -206,7 +206,8 @@ struct ToolTabView: View {
                     .overlay(Capsule().stroke(DS.C.border, lineWidth: 1))
             }
             .buttonStyle(PressableButtonStyle())
-            .disabled(toolState.isFetchingQuota || toolState.quotaBackoffActive)
+            // See MainTabView: a rate-limit backoff must not disable Refresh.
+            .disabled(toolState.isFetchingQuota)
             .accessibilityLabel(Text("Refresh \(toolState.tool.shortName) quota now"))
         }
     }

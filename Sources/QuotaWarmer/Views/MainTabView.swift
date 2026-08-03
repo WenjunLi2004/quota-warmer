@@ -83,8 +83,12 @@ struct MainTabView: View {
                     systemName: state.isFetchingQuota ? "hourglass" : state.quotaBackoffActive ? "clock.arrow.circlepath" : "arrow.clockwise",
                     help: "Refresh \(tool.shortName) quota now",
                     size: 26,
-                    isDisabled: state.isFetchingQuota || state.quotaBackoffActive
-                ) { Task { await appState.refreshQuota(for: tool) } }
+                    // Only an in-flight fetch disables Refresh. Disabling it
+                    // during a rate-limit backoff made the control dead for the
+                    // whole retry window — which is exactly when the user wants
+                    // to retry. `refreshQuotaManually` forces through it.
+                    isDisabled: state.isFetchingQuota
+                ) { Task { await appState.refreshQuotaManually(for: tool) } }
                 menuBarPin(tool, state)
             }
 

@@ -64,15 +64,6 @@ class WarmupRunner {
         }
         let pathPrefix = cliURL.deletingLastPathComponent().path
 
-        if tool == .claude {
-            switch await claudeAuthenticationStatus(pathPrefix: pathPrefix) {
-            case .authenticated, .unknown:
-                break
-            case .notAuthenticated(let message):
-                throw WarmupError.authenticationRequired(message)
-            }
-        }
-
         let workspaceURL = try warmupWorkspaceURL()
         do {
             return try await runWarmupCommand(tool.warmupCommand, cliName: cliName, pathPrefix: pathPrefix, workspaceURL: workspaceURL)

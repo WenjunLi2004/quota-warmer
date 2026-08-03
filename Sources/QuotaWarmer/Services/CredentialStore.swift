@@ -1,23 +1,47 @@
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import Security
 
 final class CredentialStore {
     private let fileManager = FileManager.default
 
-    func credential(for tool: ToolID) async throws -> Credential {
+    func credential(
+        for tool: ToolID,
+        allowsUserInteraction: Bool = false
+    ) async throws -> Credential {
         switch tool {
-        case .claude: return try claudeCredential()
+        case .claude:
+            return try claudeCredential(allowsUserInteraction: allowsUserInteraction)
         case .codex: return try codexCredential()
         }
     }
 
-    private func claudeCredential() throws -> Credential {
+    private func claudeCredential(allowsUserInteraction: Bool) throws -> Credential {
+        // Claude Code owns its Keychain item, so every read of it can raise the
+        // macOS approval dialog — the grant does not reliably survive the CLI
+        // rewriting the item on each ~8h token rotation. Mirror the still-valid
+        // access token into an item QuotaWarmer itself owns; reading our own item
+        // never prompts, so a relaunch (every login) no longer costs a dialog.
+        if let cached = cachedClaudeCredential(), !cached.isExpired {
+            DiagnosticLogger.append("claude_credential_source=mirror prompt=no")
+            return cached
+        }
+        DiagnosticLogger.append("claude_credential_source=claude-code-keychain prompt=possible")
+
         let services = claudeKeychainServices()
+        var keychainNeedsApproval = false
         for service in services {
-            if let data = keychainPassword(service: service),
-               let credential = parseClaudeCredential(data, source: "Keychain \(service)") {
-                return credential
+            switch claudeKeychainPassword(service: service, allowsUserInteraction: allowsUserInteraction) {
+            case .data(let data):
+                if let credential = parseClaudeCredential(data, source: "Keychain \(service)") {
+                    storeCachedClaudeCredential(credential)
+                    return credential
+                }
+            case .interactionRequired:
+                keychainNeedsApproval = true
+            case .notFound:
+                break
             }
         }
 
@@ -40,6 +64,9 @@ final class CredentialStore {
             return credential
         }
 
+        if keychainNeedsApproval {
+            throw CredentialError.interactionRequired("Claude")
+        }
         throw CredentialError.missing("Claude")
     }
 
@@ -107,6 +134,116 @@ final class CredentialStore {
         return item as? Data
     }
 
+    /// Generic-password item created and owned by QuotaWarmer. Because this
+    /// process added it, SecItemCopyMatching returns it without an approval
+    /// dialog, which is the whole point of mirroring the token here.
+    private static let claudeCacheService = "com.quotawarmer.app.claude-oauth-cache"
+
+    private struct CachedClaudeCredential: Codable {
+        let accessToken: String
+        let expiresAt: Date?
+        let source: String
+    }
+
+    /// Returns the mirrored credential, or nil when absent/unreadable/malformed.
+    /// Never throws: a bad cache must always fall through to the real source.
+    private func cachedClaudeCredential() -> Credential? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.claudeCacheService,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let cached = try? JSONDecoder().decode(CachedClaudeCredential.self, from: data) else {
+            return nil
+        }
+        return Credential(
+            accessToken: cached.accessToken,
+            // Deliberately not mirrored: QuotaWarmer never refreshes Claude's
+            // rotating refresh token, so it has no reason to hold a copy.
+            refreshToken: nil,
+            accountID: nil,
+            // Marked so the diagnostics log distinguishes a prompt-free mirror
+            // read from a read that had to touch Claude Code's own item.
+            source: "\(cached.source) (cached)",
+            expiresAt: cached.expiresAt
+        )
+    }
+
+    private func storeCachedClaudeCredential(_ credential: Credential) {
+        // An access token with no known expiry can never be aged out, so it is
+        // not safe to mirror — always re-read those from the owning source.
+        guard credential.expiresAt != nil else { return }
+        let cached = CachedClaudeCredential(
+            accessToken: credential.accessToken,
+            expiresAt: credential.expiresAt,
+            source: credential.source
+        )
+        guard let data = try? JSONEncoder().encode(cached) else { return }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.claudeCacheService
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            // Cache only needs to be readable while the user is logged in, and
+            // must never sync to another machine.
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var insert = query
+            insert.merge(attributes) { current, _ in current }
+            SecItemAdd(insert as CFDictionary, nil)
+        }
+    }
+
+    /// Drops the mirror so the next read goes back to Claude Code's own item.
+    /// Used when the mirrored token is rejected by the API.
+    func invalidateCachedClaudeCredential() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.claudeCacheService
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    private enum ClaudeKeychainRead {
+        case data(Data)
+        case notFound
+        case interactionRequired
+    }
+
+    /// Background quota polling must never summon a macOS password dialog.
+    /// A user-initiated Refresh is the only path allowed to request access.
+    private func claudeKeychainPassword(service: String, allowsUserInteraction: Bool) -> ClaudeKeychainRead {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        if !allowsUserInteraction {
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            query[kSecUseAuthenticationContext as String] = context
+        }
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecSuccess, let data = item as? Data {
+            return .data(data)
+        }
+        if status == errSecInteractionNotAllowed || status == errSecAuthFailed || status == errSecUserCanceled {
+            return .interactionRequired
+        }
+        return .notFound
+    }
+
     private func parseClaudeCredential(_ data: Data, source: String) -> Credential? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         let accessToken = string(in: json, keys: ["access_token", "accessToken", "claudeAiOauth.accessToken", "oauth.accessToken"])
@@ -114,7 +251,13 @@ final class CredentialStore {
         let expiresAt = date(in: json, keys: ["expires_at", "expiresAt", "claudeAiOauth.expiresAt", "oauth.expiresAt"])
 
         guard let token = accessToken, !token.isEmpty else { return nil }
-        return Credential(accessToken: token, refreshToken: refreshToken, accountID: nil, source: source, expiresAt: expiresAt)
+        return Credential(
+            accessToken: token,
+            refreshToken: refreshToken,
+            accountID: nil,
+            source: source,
+            expiresAt: expiresAt
+        )
     }
 
     private func parseCodexCredential(_ data: Data, source: String) -> Credential? {
@@ -131,7 +274,13 @@ final class CredentialStore {
         let expiresAt = date(in: json, keys: ["expires_at", "expiresAt", "tokens.expires_at", "tokens.expiresAt"])
 
         guard let token = accessToken, !token.isEmpty else { return nil }
-        return Credential(accessToken: token, refreshToken: refreshToken, accountID: accountID, source: source, expiresAt: expiresAt)
+        return Credential(
+            accessToken: token,
+            refreshToken: refreshToken,
+            accountID: accountID,
+            source: source,
+            expiresAt: expiresAt
+        )
     }
 
     private func string(in object: [String: Any], keys: [String]) -> String? {

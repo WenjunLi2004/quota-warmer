@@ -1,7 +1,13 @@
 import Foundation
 
 protocol QuotaProviding {
-    func fetchQuota(for tool: ToolID) async throws -> QuotaSnapshot
+    func fetchQuota(for tool: ToolID, allowsCredentialInteraction: Bool) async throws -> QuotaSnapshot
+}
+
+extension QuotaProviding {
+    func fetchQuota(for tool: ToolID) async throws -> QuotaSnapshot {
+        try await fetchQuota(for: tool, allowsCredentialInteraction: false)
+    }
 }
 
 final class QuotaProvider: QuotaProviding {
@@ -12,25 +18,37 @@ final class QuotaProvider: QuotaProviding {
         self.session = session
     }
 
-    func fetchQuota(for tool: ToolID) async throws -> QuotaSnapshot {
+    func fetchQuota(for tool: ToolID, allowsCredentialInteraction: Bool = false) async throws -> QuotaSnapshot {
         switch tool {
-        case .claude: return try await fetchClaudeQuota()
+        case .claude: return try await fetchClaudeQuota(allowsCredentialInteraction: allowsCredentialInteraction)
         case .codex: return try await fetchCodexQuota()
         }
     }
 
-    private func fetchClaudeQuota() async throws -> QuotaSnapshot {
-        var credential: Credential
+    private func fetchClaudeQuota(allowsCredentialInteraction: Bool) async throws -> QuotaSnapshot {
+        let credential: Credential
         do {
-            credential = try await credentialStore.credential(for: .claude)
+            credential = try await credentialStore.credential(
+                for: .claude,
+                allowsUserInteraction: allowsCredentialInteraction
+            )
+        } catch CredentialError.interactionRequired(_) {
+            throw QuotaProviderError.credentialInteractionRequired(
+                "Claude access needs approval. Click Refresh to allow Keychain access."
+            )
         } catch {
             throw QuotaProviderError.missingCredentials(
                 "Claude credentials not found; checked \(credentialStore.credentialSourceSummary(for: .claude))"
             )
         }
 
-        if credential.isExpired, let refreshed = try? await refreshClaudeCredential(credential) {
-            credential = refreshed
+        if credential.isExpired {
+            // The mirrored copy aged out; the CLI's item is the only place a
+            // newer token can appear, so stop trusting the mirror.
+            credentialStore.invalidateCachedClaudeCredential()
+            throw QuotaProviderError.cliRefreshRequired(
+                "Claude is signed in, but its quota credential needs a CLI refresh."
+            )
         }
 
         let url = URL(string: "https://api.anthropic.com/api/oauth/usage")!
@@ -39,47 +57,15 @@ final class QuotaProvider: QuotaProviding {
             return try requireRecognizedMetrics(
                 claudeSnapshot(payload: payload, source: "Claude OAuth usage", corroboratingSource: nil, message: credential.source)
             )
-        } catch QuotaProviderError.authFailure where credential.refreshToken != nil {
-            let refreshed = try await refreshClaudeCredential(credential)
-            let payload = try await requestJSON(url: url, credential: refreshed)
-            return try requireRecognizedMetrics(
-                claudeSnapshot(payload: payload, source: "Claude OAuth usage", corroboratingSource: nil, message: refreshed.source)
+        } catch QuotaProviderError.authFailure {
+            // Do not consume a potentially rotating refresh token here. Claude
+            // Code refreshes and persists its own credential when it next runs.
+            // Drop the mirror so the retry reads Claude Code's item directly.
+            credentialStore.invalidateCachedClaudeCredential()
+            throw QuotaProviderError.cliRefreshRequired(
+                "Claude is signed in, but its quota credential needs a CLI refresh."
             )
         }
-    }
-
-    private func refreshClaudeCredential(_ credential: Credential) async throws -> Credential {
-        guard let refreshToken = credential.refreshToken, !refreshToken.isEmpty else {
-            throw QuotaProviderError.authFailure("Claude token expired and no refresh token was found")
-        }
-
-        var request = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = "grant_type=refresh_token&refresh_token=\(urlEncoded(refreshToken))"
-            .data(using: .utf8)
-
-        let (data, response) = try await session.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if status == 400 || status == 401 || status == 403 {
-            throw QuotaProviderError.authFailure("Claude authorization expired")
-        }
-        guard (200..<300).contains(status) else {
-            throw QuotaProviderError.unavailable("Claude token refresh failed (\(status))")
-        }
-
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let accessToken = object["access_token"] as? String else {
-            throw QuotaProviderError.malformed("Claude token refresh response was malformed")
-        }
-        let expiresIn = (object["expires_in"] as? NSNumber)?.doubleValue
-        return Credential(
-            accessToken: accessToken,
-            refreshToken: object["refresh_token"] as? String ?? refreshToken,
-            accountID: credential.accountID,
-            source: credential.source,
-            expiresAt: expiresIn.map { Date().addingTimeInterval($0) }
-        )
     }
 
     private func fetchCodexQuota() async throws -> QuotaSnapshot {
@@ -202,11 +188,11 @@ final class QuotaProvider: QuotaProviding {
     /// The idle window carries a *projected* reset of `now + windowDuration`
     /// (mirroring Codex's sliding "if you started now" projection) so the menu
     /// bar and panel show a countdown rather than a bare percentage. It is
-    /// flagged `isIdle`, so `canAutoWarm`/`showsActiveWindow` still treat it as
-    /// "no active window" and never warm or claim it. Because that projection
-    /// slides every poll, the dedup `rawWindowKey` is keyed on a stable "idle"
-    /// marker instead of the moving timestamp. A populated `five_hour` still
-    /// parses through the generic path.
+    /// flagged `isIdle`, so it can be claimed by an opted-in auto-warm but cannot
+    /// falsely confirm that a window already opened. Because that projection slides
+    /// every poll, the dedup `rawWindowKey` is keyed on a stable "idle" marker
+    /// instead of the moving timestamp. A populated `five_hour` still parses
+    /// through the generic path.
     func claudeSnapshot(payload: Any, source: String, corroboratingSource: String?, message: String?) -> QuotaSnapshot {
         let base = snapshot(
             tool: .claude,
@@ -356,10 +342,6 @@ final class QuotaProvider: QuotaProviding {
         if let int = value as? Int { return Double(int) }
         if let string = value as? String { return Double(string) }
         return nil
-    }
-
-    private func urlEncoded(_ value: String) -> String {
-        value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? value
     }
 
     private func selectWeeklyMetric(from metrics: [QuotaMetric], now: Date) -> QuotaMetric? {

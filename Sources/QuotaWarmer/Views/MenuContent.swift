@@ -116,7 +116,7 @@ struct MenuContent: View {
                     toolState: appState.state(for: id),
                     onSetMode: { appState.setMode($0, for: id) },
                     onActivate: { appState.activate(id) },
-                    onRefresh: { Task { await appState.refreshQuota(for: id) } }
+                    onRefresh: { Task { await appState.refreshQuotaManually(for: id) } }
                 )
                 .frame(width: DS.contentWidth)
                 .frame(maxHeight: .infinity)
@@ -210,7 +210,7 @@ struct MenuContent: View {
 
     private func footerAction() {
         guard case .tool(let tool) = appState.selectedTab else { return }
-        Task { await appState.refreshQuota(for: tool) }
+        Task { await appState.refreshQuotaManually(for: tool) }
     }
 
     private func compactCountdown(_ date: Date) -> String {

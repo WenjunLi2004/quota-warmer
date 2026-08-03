@@ -25,6 +25,12 @@ struct QuotaExtractorRegression {
         )
         require(ToolID.claude.fallbackWarmupCommand != nil, "Claude warmup should have a default-model fallback")
 
+        let cliRefreshError = QuotaProviderError.cliRefreshRequired("Claude needs its CLI refresh")
+        require(
+            cliRefreshError.errorDescription == "Claude needs its CLI refresh",
+            "An expired Claude quota credential must be recoverable without reporting a false logout"
+        )
+
         let codexPayload: [String: Any] = [
             "data": [
                 "limits": [
@@ -477,13 +483,33 @@ struct QuotaExtractorRegression {
         require(claudeIdle.rawWindowKey == "Claude OAuth usage|idle",
                 "Claude idle window key must be stable (not the sliding reset)")
         requireClose(claudeIdle.weekly?.remainingFraction, 0.74, "Claude idle weekly still parses")
-        // The idle fallback is the *absence* of a claimed window — it must never
-        // confirm a warm-up or auto-warm, otherwise a warm that didn't actually
-        // open a window would read as "Window claimed", and the sliding projection
-        // would make the app warm a phantom window on every poll.
+        // The idle fallback is the absence of a claimed window. It must be
+        // claimable by auto-warm, but it cannot confirm success until live quota
+        // becomes active. Temporal dedup prevents the sliding projection from
+        // sending another warm-up during the claimed five-hour duration.
         require(!claudeIdle.showsActiveWindow(), "Claude idle 5h fallback must not count as an active claimed window")
-        require(!claudeIdle.canAutoWarm(windowDuration: ToolID.claude.windowDuration),
-                "Claude idle 5h window (sliding projection) must not allow auto warmup")
+        require(claudeIdle.canAutoWarm(windowDuration: ToolID.claude.windowDuration),
+                "Claude idle 5h window must allow an opted-in auto warmup")
+        require(
+            AutoWarmDedup.shouldWarm(
+                currentWindowKey: claudeIdle.rawWindowKey,
+                lastWarmedWindowKey: claudeIdle.rawWindowKey,
+                lastWarmedWindowEndsAt: nil,
+                currentWindowIsIdle: true,
+                now: now
+            ),
+            "Claude idle window must remain claimable when no warmed duration is active"
+        )
+        require(
+            !AutoWarmDedup.shouldWarm(
+                currentWindowKey: claudeIdle.rawWindowKey,
+                lastWarmedWindowKey: nil,
+                lastWarmedWindowEndsAt: now.addingTimeInterval(ToolID.claude.windowDuration),
+                currentWindowIsIdle: true,
+                now: now
+            ),
+            "Claude idle window must not warm again during the already-claimed duration"
+        )
 
         // A freshly-warmed window carries a live reset in the future and *must*
         // confirm the warm-up claim.
@@ -604,6 +630,114 @@ struct QuotaExtractorRegression {
             appStateSource.contains("liveMetric?.resetAt == nil || liveMetric?.isIdle == true")
                 && appStateSource.contains("state.rememberConfirmedWarmup(startedAt: result.date, duration: tool.windowDuration)"),
             "Successful warmup must persist a confirmed reset fallback when live quota has no real (non-idle) reset"
+        )
+
+        let credentialStoreSource = readSource("Sources/QuotaWarmer/Services/CredentialStore.swift")
+        require(
+            credentialStoreSource.contains("interactionNotAllowed = true")
+                && credentialStoreSource.contains("kSecUseAuthenticationContext")
+                && credentialStoreSource.contains("allowsUserInteraction"),
+            "Background Claude Keychain reads must not be allowed to open a password dialog"
+        )
+        // QuotaWarmer mirrors Claude's *access* token into an item it owns, so a
+        // relaunch does not re-trigger the macOS approval dialog. The dangerous
+        // things that mirror must never do are spelled out below; a blanket ban on
+        // Keychain writes would also forbid the safe mirror, so assert the actual
+        // invariants instead.
+        require(
+            credentialStoreSource.contains("Self.claudeCacheService")
+                && credentialStoreSource.contains("claudeCacheService = \"com.quotawarmer.app.claude-oauth-cache\""),
+            "The Claude credential mirror must live in a Keychain service QuotaWarmer owns"
+        )
+        for writeCall in ["SecItemAdd", "SecItemUpdate", "SecItemDelete"] {
+            for line in credentialStoreSource.components(separatedBy: .newlines)
+            where line.contains(writeCall) {
+                require(
+                    !line.contains("Claude Code-credentials") && !line.contains("claudeKeychainServices"),
+                    "Keychain writes must never target Claude Code's own credential item (\(writeCall))"
+                )
+            }
+        }
+        require(
+            !credentialStoreSource.contains("/v1/oauth/token")
+                && !credentialStoreSource.contains("grant_type=refresh_token"),
+            "QuotaWarmer must not run a Claude token-refresh chain of its own"
+        )
+        require(
+            credentialStoreSource.contains("struct CachedClaudeCredential")
+                && !credentialStoreSource.components(separatedBy: "struct CachedClaudeCredential")[1]
+                    .components(separatedBy: "}")[0]
+                    .contains("refreshToken"),
+            "The mirrored Claude credential must hold only the access token, never the rotating refresh token"
+        )
+        // The Refresh button was a silent no-op for the whole backoff window: a
+        // 4h rate-limit Retry-After pinned the menu bar to a stale reading and
+        // every click returned before making a request.
+        require(
+            appStateSource.contains("if force {\n                clearQuotaBackoff(for: state)"),
+            "A user-initiated refresh must clear and bypass the quota rate-limit backoff"
+        )
+        require(
+            appStateSource.contains("func refreshQuotaManually")
+                && appStateSource.components(separatedBy: "func refreshQuotaManually")[1]
+                    .components(separatedBy: "\n    }")[0]
+                    .contains("force: true"),
+            "The Refresh button must force its fetch through, not return early on backoff"
+        )
+        for viewPath in ["Sources/QuotaWarmer/Views/MainTabView.swift", "Sources/QuotaWarmer/Views/MenuContent.swift"] {
+            require(
+                !readSource(viewPath).contains("appState.refreshQuota(for:"),
+                "\(viewPath) must route its Refresh control through refreshQuotaManually"
+            )
+        }
+        // The bug the user actually hit: forcing the fetch through the backoff in
+        // AppState is useless while the control that triggers it is greyed out for
+        // the entire retry window, which is precisely when a retry is wanted.
+        for viewPath in ["Sources/QuotaWarmer/Views/MainTabView.swift", "Sources/QuotaWarmer/Views/ToolTabView.swift"] {
+            let source = readSource(viewPath)
+            require(
+                !source.contains("isFetchingQuota || state.quotaBackoffActive")
+                    && !source.contains("isFetchingQuota || toolState.quotaBackoffActive"),
+                "\(viewPath) must not disable Refresh while a quota rate-limit backoff is active"
+            )
+        }
+        require(
+            appStateSource.contains("guard tool != .claude || !state.isFetchingQuota else { return }"),
+            "Concurrent Claude refresh triggers must collapse to a single in-flight request chain"
+        )
+        require(
+            appStateSource.contains("let shouldAutoWarm = tool == .claude && state(for: tool).isAutoWarmEnabled"),
+            "A manual Claude refresh must immediately resume an opted-in auto-warm after credential approval"
+        )
+        require(
+            appStateSource.contains("if tool == .claude { state.isFetchingQuota = false }"),
+            "Claude auto-warm must release the outer fetch before post-warm verification"
+        )
+        let quotaProviderSource = readSource("Sources/QuotaWarmer/Services/QuotaProvider.swift")
+        require(
+            !quotaProviderSource.contains("credential.isExpired, let refreshed = try?"),
+            "An expired Claude credential refresh failure must not be swallowed before another request"
+        )
+        require(
+            quotaProviderSource.contains("QuotaProviderError.cliRefreshRequired")
+                && quotaProviderSource.contains("credentialStore.invalidateCachedClaudeCredential()")
+                && !quotaProviderSource.contains("/v1/oauth/token"),
+            "Expired Claude credentials must defer refresh-token rotation to Claude Code and re-read its fresh credential"
+        )
+        require(
+            appStateSource.contains("allowsClaudeCLIRecovery")
+                && appStateSource.contains("triggerWarmup(tool: .claude, mode: \"auto\")"),
+            "Auto-warm must run Claude Code once to recover its own expired credential before retrying quota"
+        )
+        require(
+            !appStateSource.contains("let cliReady = await applyCLIAuthenticationStatusIfNeeded(for: tool, to: state)")
+                && appStateSource.contains("if allowAutomaticWarmup {"),
+            "A successful Claude OAuth quota fetch must not be overridden by headless CLI auth status"
+        )
+        let warmupRunnerSource = readSource("Sources/QuotaWarmer/Services/WarmupRunner.swift")
+        require(
+            !warmupRunnerSource.contains("switch await claudeAuthenticationStatus(pathPrefix: pathPrefix)"),
+            "Claude warmup must let the actual command, not a headless status preflight, determine auth failure"
         )
 
         print("quota extractor regression tests passed")

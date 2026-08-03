@@ -156,6 +156,10 @@ enum ToolStatusCopy {
         if state.quotaBackoffActive, let until = state.quotaBackoffUntil {
             return "Quota source is rate-limited. Retrying at \(shortClock(until))."
         }
+        if state.tool == .claude,
+           state.healthMessage.contains("quota credential needs a CLI refresh") {
+            return "Claude is signed in. Its quota will refresh when Claude runs; the last known reading is shown for context."
+        }
         if state.freshness == .expired, let fetched = state.lastSuccessfulFetch {
             return "Live quota has not updated since \(shortClock(fetched)). Showing the last known reading."
         }
@@ -185,6 +189,9 @@ enum ToolStatusCopy {
     private static func authActionText(for state: ToolState) -> String {
         switch state.tool {
         case .claude:
+            if state.healthMessage.contains("access needs approval") {
+                return "Claude access is paused. Click Refresh to approve Keychain access."
+            }
             return "Claude needs reconnecting. Run claude auth login in Terminal, then Refresh."
         case .codex:
             return "Codex needs reconnecting. Sign in again, then Refresh."

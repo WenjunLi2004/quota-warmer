@@ -362,22 +362,61 @@ final class AppState: ObservableObject {
         }
     }
 
-    func refreshQuota(for tool: ToolID, allowAutomaticWarmup: Bool = false, reconcileStuckOutcome: Bool = true) async {
+    /// The Refresh button. Unlike a timer poll this must always do something the
+    /// user can see: it ignores an outstanding rate-limit backoff (which would
+    /// otherwise leave the button a silent no-op for the whole retry window) and
+    /// may show the Keychain approval dialog, because a click is the one moment
+    /// interaction is wanted. An opted-in auto-warm still resumes here, bounded
+    /// to once per window by the usual dedup, so approving access mid-window
+    /// claims it instead of waiting for the next tick.
+    func refreshQuotaManually(for tool: ToolID) async {
+        let shouldAutoWarm = tool == .claude && state(for: tool).isAutoWarmEnabled
+        await refreshQuota(
+            for: tool,
+            allowAutomaticWarmup: shouldAutoWarm,
+            allowsCredentialInteraction: tool == .claude,
+            force: true
+        )
+    }
+
+    func refreshQuota(
+        for tool: ToolID,
+        allowAutomaticWarmup: Bool = false,
+        reconcileStuckOutcome: Bool = true,
+        allowsCredentialInteraction: Bool = false,
+        allowsClaudeCLIRecovery: Bool = true,
+        force: Bool = false
+    ) async {
         let state = state(for: tool)
+        // Timer, wake and scheduler callbacks can converge on the same instant.
+        // Claude refresh tokens are single-use, so only one Claude request chain
+        // may run at a time. Codex keeps its existing behavior unchanged.
+        guard tool != .claude || !state.isFetchingQuota else { return }
         refreshTokenUsage(for: tool)
         if let backoffUntil = state.quotaBackoffUntil, backoffUntil > Date() {
-            state.nextRefreshAt = backoffUntil
-            state.errorMessage = rateLimitMessage(until: backoffUntil)
-            state.healthMessage = state.errorMessage ?? state.healthMessage
-            scheduleQuotaRefresh(for: tool, at: backoffUntil)
-            return
+            // An explicit user request retries now. Clearing the backoff matters
+            // as much as skipping it: a source that is no longer limited must be
+            // able to return to healthy instead of staying pinned to the stale
+            // reading until the original retry time.
+            if force {
+                clearQuotaBackoff(for: state)
+            } else {
+                state.nextRefreshAt = backoffUntil
+                state.errorMessage = rateLimitMessage(until: backoffUntil)
+                state.healthMessage = state.errorMessage ?? state.healthMessage
+                scheduleQuotaRefresh(for: tool, at: backoffUntil)
+                return
+            }
         }
 
         state.isFetchingQuota = true
         state.errorMessage = nil
 
         do {
-            let snapshot = try await quotaProvider.fetchQuota(for: tool)
+            let snapshot = try await quotaProvider.fetchQuota(
+                for: tool,
+                allowsCredentialInteraction: allowsCredentialInteraction
+            )
             clearQuotaBackoff(for: state)
             clearAuthRetry(for: state)
             lastSuccessfulPollAt = Date()
@@ -391,7 +430,6 @@ final class AppState: ObservableObject {
             // warm-up is in flight, and skipped on the recheck path (which calls
             // evaluateWarmupClaim right after) so the two never both confirm.
             if reconcileStuckOutcome, !state.isWarming { reconcileWarmupOutcome(for: state) }
-            let cliReady = await applyCLIAuthenticationStatusIfNeeded(for: tool, to: state)
             addHistory(
                 tool: tool,
                 kind: .quotaFetch,
@@ -400,11 +438,31 @@ final class AppState: ObservableObject {
             )
             rescheduleRefresh(for: tool)
 
-            if allowAutomaticWarmup, cliReady {
+            // A successful OAuth quota response is stronger evidence than the
+            // headless `claude auth status` probe, which can report logged-out
+            // even while the real Claude CLI and OAuth credential are usable.
+            // The actual warm-up command still reports authentication failure.
+            if allowAutomaticWarmup {
+                // Claude serializes quota fetches. Release the outer fetch before
+                // the warm-up path performs its post-command verification fetch;
+                // otherwise the single-flight guard would discard that proof.
+                if tool == .claude { state.isFetchingQuota = false }
                 await attemptAutomaticWarmup(tool: tool, reason: "fresh quota")
             }
         } catch {
             applyQuotaError(error, to: state)
+            if tool == .claude,
+               allowsClaudeCLIRecovery,
+               state.isAutoWarmEnabled,
+               !globalPassive,
+               let providerError = error as? QuotaProviderError,
+               case .cliRefreshRequired = providerError {
+                // The Claude CLI, not QuotaWarmer, owns its rotating OAuth
+                // credential. Its normal warm command refreshes that chain,
+                // then this command's regular post-warm fetch reads it again.
+                state.isFetchingQuota = false
+                _ = await triggerWarmup(tool: .claude, mode: "auto")
+            }
         }
 
         state.isFetchingQuota = false
@@ -733,7 +791,11 @@ final class AppState: ObservableObject {
             )
             notifications.notifyWarmupCommandSent(tool: tool)
             state.lastWarmupOutcome = .pending(sentAt: result.date)
-            await refreshQuota(for: tool, allowAutomaticWarmup: false)
+            await refreshQuota(
+                for: tool,
+                allowAutomaticWarmup: false,
+                allowsClaudeCLIRecovery: false
+            )
             // No *real* live window yet: either no reset at all, or only an idle
             // "if you started now" projection (Claude's null `five_hour` is now
             // surfaced as an idle window with a sliding reset). Record the
@@ -1007,12 +1069,26 @@ final class AppState: ObservableObject {
 
         if let providerError = error as? QuotaProviderError {
             switch providerError {
+            case .credentialInteractionRequired:
+                clearQuotaBackoff(for: state)
+                clearAuthRetry(for: state)
+                state.sourceHealth = .authFailure
+                state.authStatus = .missing
+                addHistory(tool: state.tool, kind: .authFailure, title: "Claude access needs approval", detail: message)
+            case .cliRefreshRequired:
+                clearQuotaBackoff(for: state)
+                clearAuthRetry(for: state)
+                state.errorMessage = nil
+                state.healthMessage = message
+                state.sourceHealth = .stale
+                state.authStatus = .available
+                addHistory(tool: state.tool, kind: .quotaFetch, title: "Claude CLI refresh needed", detail: message)
             case .authFailure:
                 clearQuotaBackoff(for: state)
+                clearAuthRetry(for: state)
                 state.sourceHealth = .authFailure
                 state.authStatus = .failed
                 addHistory(tool: state.tool, kind: .authFailure, title: "Authorization failed", detail: message)
-                scheduleClaudeAuthRecheckIfNeeded(for: state, reason: message)
             case .missingCredentials:
                 clearQuotaBackoff(for: state)
                 state.sourceHealth = .authFailure
@@ -1172,72 +1248,3 @@ final class AppState: ObservableObject {
 
 /// Diagnostic logging verbosity, set from the menu-bar right-click menu.
 /// `.off` silences the on-disk diagnostics log entirely.
-enum DebugLevel: Int, CaseIterable {
-    case off = 0
-    case normal = 1
-    case verbose = 2
-
-    var title: String {
-        switch self {
-        case .off:     return "Off"
-        case .normal:  return "Normal"
-        case .verbose: return "Verbose"
-        }
-    }
-
-    static var current: DebugLevel {
-        get {
-            let raw = UserDefaults.standard.object(forKey: "debugLevel") as? Int ?? DebugLevel.normal.rawValue
-            return DebugLevel(rawValue: raw) ?? .normal
-        }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: "debugLevel") }
-    }
-}
-
-enum DiagnosticLogger {
-    static let fileURL = URL(fileURLWithPath: "/tmp/quotawarmer-diagnostics.log")
-
-    private static let formatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    static func appendHistory(_ event: HistoryEvent) {
-        let tool = event.tool?.rawValue ?? "app"
-        append("history tool=\(tool) kind=\(event.kind.rawValue) title=\(event.title) detail=\(event.detail)")
-    }
-
-    static func append(_ message: String) {
-        guard DebugLevel.current != .off else { return }
-        let line = "[\(formatter.string(from: Date()))] \(redacted(message))\n"
-        guard let data = line.data(using: .utf8) else { return }
-
-        if FileManager.default.fileExists(atPath: fileURL.path),
-           let handle = try? FileHandle(forWritingTo: fileURL) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: fileURL, options: .atomic)
-        }
-    }
-
-    private static func redacted(_ text: String) -> String {
-        var output = text
-        let patterns = [
-            #"sk-[A-Za-z0-9._-]{12,}"#,
-            #"Bearer\s+[A-Za-z0-9._-]{12,}"#,
-            #"Authorization[:=]\s*[A-Za-z0-9._\-\s]{12,}"#
-        ]
-
-        for pattern in patterns {
-            output = output.replacingOccurrences(
-                of: pattern,
-                with: "<redacted>",
-                options: .regularExpression
-            )
-        }
-        return output
-    }
-}
