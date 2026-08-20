@@ -2,7 +2,10 @@ import SwiftUI
 
 struct MainTabView: View {
     @EnvironmentObject var appState: AppState
-    @State private var historyExpanded = true
+    @State private var historyExpanded = false
+    // Session-only display state — never persisted, so every popover open
+    // starts with both provider sections expanded (empty = nothing collapsed).
+    @State private var collapsedTools: Set<ToolID> = []
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -54,28 +57,38 @@ struct MainTabView: View {
     }
 
     private var providerList: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 12) {
             ForEach(ToolID.allCases) { tool in
                 providerRow(tool)
-                if tool != ToolID.allCases.last {
-                    Rectangle()
-                        .fill(DS.C.border)
-                        .frame(height: 1)
-                        .padding(.vertical, 18)
-                }
             }
         }
     }
 
     private func providerRow(_ tool: ToolID) -> some View {
         let state = appState.state(for: tool)
-        return VStack(alignment: .leading, spacing: 16) {
+        let collapsed = collapsedTools.contains(tool)
+        return VStack(alignment: .leading, spacing: collapsed ? 0 : 16) {
             // Tool name on the left, the same mode / refresh / pin controls on
             // the right (where the reference shows the plan badge).
             HStack(spacing: 8) {
-                Text(tool.shortName)
-                    .font(.system(size: 20, weight: .bold))
-                    .foregroundStyle(DS.C.text)
+                Button(action: { toggleCollapsed(tool) }) {
+                    HStack(spacing: 6) {
+                        Text(tool.shortName)
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundStyle(DS.C.text)
+                        Image(systemName: collapsed ? "chevron.down" : "chevron.up")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(DS.C.textMuted)
+                    }
+                    // The label's natural bounds are just the glyphs — pad the
+                    // hit area out to a comfortably tappable rectangle instead
+                    // of relying on precise glyph-edge hits.
+                    .padding(.vertical, 6)
+                    .padding(.trailing, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(PressableButtonStyle())
+                .accessibilityLabel(Text(collapsed ? "Expand \(tool.shortName) section" : "Collapse \(tool.shortName) section"))
                 Spacer(minLength: 6)
                 ToolModeMenu(mode: state.mode, compact: true) { appState.setMode($0, for: tool) }
                     .fixedSize()
@@ -92,18 +105,31 @@ struct MainTabView: View {
                 menuBarPin(tool, state)
             }
 
-            if let issue = providerIssue(state) {
-                Text(issue)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(DS.C.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            if !collapsed {
+                if let issue = providerIssue(state) {
+                    Text(issue)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(DS.C.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
-            windowRow(state, title: "Session", metric: state.primaryMetric,
-                      resetAt: state.resetAt, windowDuration: tool.windowDuration,
-                      settling: state.sessionSettling)
-            windowRow(state, title: "Weekly", metric: state.weeklyMetric,
-                      resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+                windowRow(state, title: "Session", metric: state.primaryMetric,
+                          resetAt: state.resetAt, windowDuration: tool.windowDuration,
+                          settling: state.sessionSettling)
+                windowRow(state, title: "Weekly", metric: state.weeklyMetric,
+                          resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+            }
+        }
+        .padding(.horizontal, collapsed ? 12 : 14)
+        .padding(.vertical, collapsed ? 9 : 13)
+        .dsCard()
+    }
+
+    private func toggleCollapsed(_ tool: ToolID) {
+        if collapsedTools.contains(tool) {
+            collapsedTools.remove(tool)
+        } else {
+            collapsedTools.insert(tool)
         }
     }
 
