@@ -28,7 +28,7 @@ struct MainTabView: View {
         // tagline, and a size that leaves the quota readings as the headline.
         HStack(alignment: .center) {
             Text("QuotaWarmer")
-                .font(.system(size: 15, weight: .semibold))
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(DS.C.text)
             Spacer()
             automationControl
@@ -72,7 +72,7 @@ struct MainTabView: View {
                 Button(action: { toggleCollapsed(tool) }) {
                     HStack(spacing: 6) {
                         Text(tool.shortName)
-                            .font(.system(size: 17, weight: .semibold))
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(DS.C.text)
                         Image(systemName: collapsed ? "chevron.down" : "chevron.up")
                             .font(.system(size: 11, weight: .semibold))
@@ -115,8 +115,7 @@ struct MainTabView: View {
                           resetAt: state.resetAt, windowDuration: tool.windowDuration,
                           settling: state.sessionSettling)
                 windowRow(state, title: "Weekly", metric: state.weeklyMetric,
-                          resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration,
-                          prominent: false)
+                          resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
             }
         }
         .padding(.horizontal, collapsed ? 12 : 14)
@@ -132,7 +131,7 @@ struct MainTabView: View {
         }
     }
 
-    private func windowRow(_ state: ToolState, title: String, metric: QuotaMetric?, resetAt: Date?, windowDuration: TimeInterval, settling: Bool = false, prominent: Bool = true) -> some View {
+    private func windowRow(_ state: ToolState, title: String, metric: QuotaMetric?, resetAt: Date?, windowDuration: TimeInterval, settling: Bool = false) -> some View {
         let quotaLeft = metric?.remainingFraction ?? 0
         // A just-opened window the provider transiently reports as near-empty:
         // show the reset countdown but neither the bogus "0% left" nor the
@@ -158,8 +157,7 @@ struct MainTabView: View {
             leftText: leftText,
             pace: pace,
             refreshing: state.isFetchingQuota || settlingActive,
-            statusColor: ToolStatusCopy.rowStatusColor(for: state, hasMetric: metric != nil),
-            prominent: prominent
+            statusColor: ToolStatusCopy.rowStatusColor(for: state, hasMetric: metric != nil)
         )
     }
 
@@ -258,10 +256,10 @@ struct MainTabView: View {
                 .padding(.top, 3)
             VStack(alignment: .leading, spacing: 1) {
                 Text(tool.shortName)
-                    .font(.system(size: 11.5, weight: .bold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(DS.C.text)
                 Text(info.message)
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(.system(size: 11))
                     .foregroundStyle(DS.C.textSub)
                     .fixedSize(horizontal: false, vertical: true)
             }

@@ -151,7 +151,7 @@ private enum MenuBarComposer {
     private static let height: CGFloat = 18
     private static let glyph: CGFloat = 13
     private static let glyphGap: CGFloat = 4
-    private static let itemGap: CGFloat = 11
+    private static let itemGap: CGFloat = 16
 
     static func image(for items: [Item]) -> NSImage {
         var widths: [CGFloat] = []

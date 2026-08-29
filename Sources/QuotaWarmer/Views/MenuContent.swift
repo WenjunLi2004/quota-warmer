@@ -49,11 +49,10 @@ struct MenuContent: View {
 
     private var panel: some View {
         VStack(spacing: 0) {
+            // No rule between rail and content: the divider plus the rail's own
+            // tint were what made the panel read as two halves rather than one.
             HStack(spacing: 0) {
                 sidebar
-                Rectangle()
-                    .fill(DS.C.border)
-                    .frame(width: 1)
                 mainContent
             }
             footerStrip

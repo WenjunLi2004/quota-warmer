@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 extension Color {
@@ -13,34 +14,45 @@ extension Color {
     }
 }
 
-/// Design tokens. Tuned to the OpenUsage visual language: a white content
-/// surface, a narrow off-white sidebar, hairline borders, navy-near-black
-/// titles, slate body text, muted meta text, and slim near-black usage bars.
+/// Design tokens, drawn from the system palette rather than hand-picked hexes.
+///
+/// The previous values were a fixed light-mode web palette (Tailwind slate),
+/// which is why the panel read as a web page transplanted onto macOS and why
+/// it never followed the system appearance. Everything below now resolves
+/// through AppKit's semantic colors, so the panel tracks light/dark, Increase
+/// Contrast and accent settings the way every native Mac app does — and dark
+/// mode works without a second palette to maintain.
 enum DS {
     enum C {
         // Surfaces
-        static let bg          = Color(hex: 0xFFFFFF)   // window + content base (white)
-        static let sidebar     = Color(hex: 0xF8FAFC)   // narrow left rail
-        static let surface     = Color(hex: 0xFFFFFF)   // cards
-        static let surfaceHigh = Color(hex: 0xF1F5F9)   // quiet button / segmented fill (slate-100)
-        static let track       = Color(hex: 0xE9EDF2)   // progress track
-        static let ink         = Color(hex: 0x0F172A)   // near-black navy: bar fill, selected indicator
+        /// The bright page surface documents use — white in light, near-black in
+        /// dark, and it does not pick up desktop wallpaper tint.
+        static let bg          = Color(nsColor: .textBackgroundColor)
+        /// The rail sits on the same surface as the content on purpose: giving it
+        /// its own tint (plus a divider) split the panel into two glued-together
+        /// halves instead of one window.
+        static let sidebar     = Color(nsColor: .textBackgroundColor)
+        static let surface     = Color(nsColor: .textBackgroundColor)
+        static let surfaceHigh = Color(nsColor: .controlColor)   // quiet button fill
+        static let track       = Color.primary.opacity(0.12)     // progress track
+        static let ink         = Color.primary                   // bar fill
 
         // Borders
-        static let border      = Color(hex: 0xE5E7EB)   // hairline card / divider border
-        static let borderSoft  = Color(hex: 0xEEF1F5)   // very subtle inner divider
-        static let borderFocus = Color.black.opacity(0.16)
+        static let border      = Color(nsColor: .separatorColor)
+        static let borderSoft  = Color(nsColor: .separatorColor).opacity(0.6)
+        static let borderFocus = Color(nsColor: .separatorColor)
 
         // Text
-        static let text        = Color(hex: 0x0F172A)   // titles (navy near-black)
-        static let textSub     = Color(hex: 0x475569)   // body (slate-600)
-        static let textMuted   = Color(hex: 0x94A3B8)   // meta (slate-400)
+        static let text        = Color.primary
+        static let textSub     = Color.secondary
+        static let textMuted   = Color(nsColor: .tertiaryLabelColor)
 
-        // Status
-        static let green  = Color(hex: 0x16A34A)
-        static let yellow = Color(hex: 0xD97706)
-        static let red    = Color(hex: 0xDC2626)
-        static let blue   = Color(hex: 0x2563EB)
+        // Status — the system traffic-light palette, so the dots and bars match
+        // every other status indicator on the machine.
+        static let green  = Color(nsColor: .systemGreen)
+        static let yellow = Color(nsColor: .systemYellow)
+        static let red    = Color(nsColor: .systemRed)
+        static let blue   = Color(nsColor: .systemBlue)
 
         /// Per-tool brand accent. Kept as-is to preserve product identity.
         static func accent(_ tool: ToolID) -> Color {
@@ -73,10 +85,12 @@ enum DS {
     // full size, which reads as blurry rather than merely small — so the sizes
     // below are tuned to need no downscaling at all. Keep this at 1.0.
     static let panelScale: CGFloat = 1.0
-    static let sidebarWidth: CGFloat = 56
-    static let contentWidth: CGFloat = 340
+    // A narrow rail that shares the content's surface reads as a margin holding
+    // icons; a wide tinted one reads as a second pane bolted to the first.
+    static let sidebarWidth: CGFloat = 34
+    static let contentWidth: CGFloat = 320
     static let totalWidth:   CGFloat = sidebarWidth + contentWidth
-    static let totalHeight: CGFloat = 520
+    static let totalHeight: CGFloat = 500
 
     // MARK: - Typography
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
@@ -87,18 +101,22 @@ enum DS {
 // MARK: - View modifiers
 
 extension View {
-    /// Standard white card with a hairline border.
+    /// Grouped card in the macOS System Settings idiom: a quiet system fill and
+    /// no border. Outlining every card was the web habit that made the panel
+    /// look boxed-in; the fill alone carries the grouping, and it follows the
+    /// system appearance for free.
     func dsCard(radius: CGFloat = DS.R.lg) -> some View {
-        self
-            .background(DS.C.surface, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).stroke(DS.C.border, lineWidth: 1))
+        self.background {
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .fill(.quaternary)
+        }
     }
 
     /// Uppercase, letter-spaced section label (e.g. "WINDOW STATUS").
     func dsSectionLabel() -> some View {
-        self.font(.system(size: 10, weight: .semibold))
+        self.font(.system(size: 11, weight: .semibold))
             .foregroundStyle(DS.C.textMuted)
-            .tracking(0.7)
+            .tracking(0.6)
             .textCase(.uppercase)
     }
 }
