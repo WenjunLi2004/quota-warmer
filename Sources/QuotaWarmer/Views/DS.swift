@@ -68,14 +68,15 @@ enum DS {
     }
 
     // MARK: - Layout
-    // The panel is laid out at totalWidth × totalHeight then uniformly
-    // scaled by panelScale, so this knob shrinks the whole UI proportionally
-    // without any reflow. 0.81 = a 10% more compact panel than the prior 0.90.
-    static let panelScale: CGFloat = 0.81
+    // The panel is laid out at totalWidth × totalHeight and rendered 1:1.
+    // A non-integral panelScale resamples text that was already rasterised at
+    // full size, which reads as blurry rather than merely small — so the sizes
+    // below are tuned to need no downscaling at all. Keep this at 1.0.
+    static let panelScale: CGFloat = 1.0
     static let sidebarWidth: CGFloat = 56
-    static let contentWidth: CGFloat = 372
+    static let contentWidth: CGFloat = 340
     static let totalWidth:   CGFloat = sidebarWidth + contentWidth
-    static let totalHeight: CGFloat = 560
+    static let totalHeight: CGFloat = 520
 
     // MARK: - Typography
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {

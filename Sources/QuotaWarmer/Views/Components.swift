@@ -217,25 +217,100 @@ struct QuotaWindowRow: View {
     let pace: QuotaPace.Result
     var refreshing: Bool = false
     var statusColor: Color? = nil
+    /// `true` gives the row the headline treatment: the percentage is set large
+    /// because it is the reading the panel exists to show. `false` is the quiet
+    /// one-line variant used for the weekly window, which is context rather than
+    /// the main event — it keeps both numbers but stops competing for attention.
+    var prominent: Bool = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Text(title)
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(DS.C.text)
-                StatusDot(color: statusColor ?? dotColor, size: 8)
-            }
-
-            UsageBar(fraction: quotaLeft, refreshing: refreshing, height: 12,
-                     thumbFraction: pace.timeLeftFraction)
-
-            VStack(spacing: 3) {
-                metaLine(left: leftText, right: pace.resetText)
+        VStack(alignment: .leading, spacing: prominent ? 9 : 6) {
+            if prominent {
+                rowLabel(dotSize: 7)
+                headlineRow
+                UsageBar(fraction: quotaLeft, refreshing: refreshing, height: 10,
+                         thumbFraction: pace.timeLeftFraction)
                 if let shortPercent = pace.shortPercent {
                     metaLine(left: "\(shortPercent)% short", right: pace.runsOutText ?? "")
                 }
+            } else {
+                compactLine
+                UsageBar(fraction: quotaLeft, refreshing: refreshing, height: 5,
+                         fill: DS.C.textSub, thumbFraction: pace.timeLeftFraction)
             }
+        }
+    }
+
+    /// Uppercase window name + health dot. Demoted from a 15pt bold title to a
+    /// label so it sits above the number rather than rivalling it.
+    private func rowLabel(dotSize: CGFloat) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(DS.C.textMuted)
+                .tracking(0.6)
+                .textCase(.uppercase)
+            StatusDot(color: statusColor ?? dotColor, size: dotSize)
+        }
+    }
+
+    private var headlineRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            headlineValue
+            Spacer(minLength: 6)
+            Text(pace.resetText)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(DS.C.textMuted)
+                .monospacedDigit()
+        }
+    }
+
+    /// Splits "71% left" into a large number and a small suffix. Strings with no
+    /// space ("Updating...") have no number to enlarge, so they stay one size.
+    @ViewBuilder
+    private var headlineValue: some View {
+        if headlineNumber.isEmpty {
+            Text(headlineSuffix)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(DS.C.textSub)
+        } else {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(headlineNumber)
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(DS.C.text)
+                    .monospacedDigit()
+                Text(headlineSuffix)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(DS.C.textSub)
+            }
+        }
+    }
+
+    private var headlineNumber: String {
+        guard let space = leftText.firstIndex(of: " ") else { return "" }
+        return String(leftText[leftText.startIndex..<space])
+    }
+
+    private var headlineSuffix: String {
+        guard let space = leftText.firstIndex(of: " ") else { return leftText }
+        return String(leftText[leftText.index(after: space)...])
+    }
+
+    private var compactLine: some View {
+        HStack(spacing: 6) {
+            rowLabel(dotSize: 6)
+            Spacer(minLength: 6)
+            Text(leftText)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(DS.C.textSub)
+                .monospacedDigit()
+            Text("·")
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(DS.C.textMuted)
+            Text(pace.resetText)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(DS.C.textMuted)
+                .monospacedDigit()
         }
     }
 

@@ -94,7 +94,8 @@ enum MenuBarStatus {
 
     private static func compactQuotaText(time: TimeInterval, metric: QuotaMetric?) -> String {
         let percent = Int((metric?.remainingFraction ?? 0) * 100)
-        return "\(compactTime(time)) - \(percent)%"
+        // Middle dot rather than a hyphen: "1h05m - 71%" reads as a subtraction.
+        return "\(compactTime(time)) · \(percent)%"
     }
 
     private static func nsStatusColor(for state: ToolState, appState: AppState) -> NSColor {
@@ -143,11 +144,14 @@ private enum MenuBarComposer {
         let dimmed: Bool
     }
 
-    private static let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+    // 13pt regular is what the system menu bar sets its own text in; the
+    // previous 11pt semibold read as both small and heavy beside it, and a
+    // 15pt glyph towered over 11pt digits instead of sitting level with them.
+    private static let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
     private static let height: CGFloat = 18
-    private static let glyph: CGFloat = 15
-    private static let glyphGap: CGFloat = 3
-    private static let itemGap: CGFloat = 8
+    private static let glyph: CGFloat = 13
+    private static let glyphGap: CGFloat = 4
+    private static let itemGap: CGFloat = 11
 
     static func image(for items: [Item]) -> NSImage {
         var widths: [CGFloat] = []
@@ -199,7 +203,7 @@ private enum MenuBarComposer {
         }
 
         // Status dot at the glyph's bottom-right corner.
-        let dot: CGFloat = 5.5
+        let dot: CGFloat = 5
         let dotRect = NSRect(x: logoRect.maxX - dot + 1, y: logoRect.minY - 0.5, width: dot, height: dot)
         item.dotColor.withAlphaComponent(alpha).setFill()
         NSBezierPath(ovalIn: dotRect).fill()

@@ -23,15 +23,13 @@ struct MainTabView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("QuotaWarmer")
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(DS.C.text)
-                Text("Keep your quota windows warm.")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(DS.C.textMuted)
-            }
+        // Whoever opened this panel just clicked the app's own menu bar icon,
+        // so the name identifies the window rather than introducing it — no
+        // tagline, and a size that leaves the quota readings as the headline.
+        HStack(alignment: .center) {
+            Text("QuotaWarmer")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(DS.C.text)
             Spacer()
             automationControl
         }
@@ -74,7 +72,7 @@ struct MainTabView: View {
                 Button(action: { toggleCollapsed(tool) }) {
                     HStack(spacing: 6) {
                         Text(tool.shortName)
-                            .font(.system(size: 20, weight: .bold))
+                            .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(DS.C.text)
                         Image(systemName: collapsed ? "chevron.down" : "chevron.up")
                             .font(.system(size: 11, weight: .semibold))
@@ -117,7 +115,8 @@ struct MainTabView: View {
                           resetAt: state.resetAt, windowDuration: tool.windowDuration,
                           settling: state.sessionSettling)
                 windowRow(state, title: "Weekly", metric: state.weeklyMetric,
-                          resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+                          resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration,
+                          prominent: false)
             }
         }
         .padding(.horizontal, collapsed ? 12 : 14)
@@ -133,7 +132,7 @@ struct MainTabView: View {
         }
     }
 
-    private func windowRow(_ state: ToolState, title: String, metric: QuotaMetric?, resetAt: Date?, windowDuration: TimeInterval, settling: Bool = false) -> some View {
+    private func windowRow(_ state: ToolState, title: String, metric: QuotaMetric?, resetAt: Date?, windowDuration: TimeInterval, settling: Bool = false, prominent: Bool = true) -> some View {
         let quotaLeft = metric?.remainingFraction ?? 0
         // A just-opened window the provider transiently reports as near-empty:
         // show the reset countdown but neither the bogus "0% left" nor the
@@ -159,7 +158,8 @@ struct MainTabView: View {
             leftText: leftText,
             pace: pace,
             refreshing: state.isFetchingQuota || settlingActive,
-            statusColor: ToolStatusCopy.rowStatusColor(for: state, hasMetric: metric != nil)
+            statusColor: ToolStatusCopy.rowStatusColor(for: state, hasMetric: metric != nil),
+            prominent: prominent
         )
     }
 
