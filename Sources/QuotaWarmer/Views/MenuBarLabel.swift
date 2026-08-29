@@ -75,9 +75,11 @@ enum MenuBarStatus {
                 assetName: tool == .claude ? "ClaudeCode" : "Codex",
                 dotColor: nsStatusColor(for: st, appState: appState),
                 text: text,
-                // Neutral menu-bar-white text (the colored status dot conveys
-                // state), not a saturated color.
-                textColor: .white,
+                // Follows the menu bar's own appearance instead of assuming a
+                // dark bar — hardcoded white disappeared entirely on a light
+                // one. The colored status dot carries state, so the text itself
+                // stays neutral.
+                textColor: .labelColor,
                 dimmed: !prominent
             )
         }
@@ -89,7 +91,10 @@ enum MenuBarStatus {
         let h = (total % 86_400) / 3600
         let m = (total % 3600) / 60
         if d > 0 { return "\(d)d\(h)h" }
-        return h > 0 ? "\(h)h\(String(format: "%02d", m))m" : "\(m)m"
+        // Clock-style ("4:52", "0:23") rather than "4h52m": two fewer glyphs in a
+        // crowded menu bar, and the always-two-wide minutes stop the readout from
+        // shifting sideways every time it ticks.
+        return "\(h):\(String(format: "%02d", m))"
     }
 
     private static func compactQuotaText(time: TimeInterval, metric: QuotaMetric?) -> String {
@@ -151,7 +156,7 @@ private enum MenuBarComposer {
     private static let height: CGFloat = 18
     private static let glyph: CGFloat = 13
     private static let glyphGap: CGFloat = 4
-    private static let itemGap: CGFloat = 16
+    private static let itemGap: CGFloat = 20
 
     static func image(for items: [Item]) -> NSImage {
         var widths: [CGFloat] = []
@@ -197,8 +202,9 @@ private enum MenuBarComposer {
                 respectFlipped: true,
                 hints: [.interpolation: NSImageInterpolation.high]
             )
-            // Recolor the monochrome glyph to white, preserving its alpha.
-            NSColor.white.withAlphaComponent(alpha).setFill()
+            // Recolor the monochrome glyph to the menu bar's label color,
+            // preserving its alpha.
+            NSColor.labelColor.withAlphaComponent(alpha).setFill()
             logoRect.fill(using: .sourceAtop)
         }
 

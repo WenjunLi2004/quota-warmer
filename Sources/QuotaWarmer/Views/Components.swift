@@ -27,8 +27,11 @@ struct UsageBar: View {
                     .fill(fill)
                     .frame(width: fillW)
                 if refreshing {
+                    // The page surface, not white: the bar's own fill is light in
+                    // dark mode, where a white sheen was invisible. This tracks
+                    // the appearance and stays visible against either fill.
                     Capsule()
-                        .fill(.white.opacity(0.22))
+                        .fill(DS.C.bg.opacity(0.30))
                         .frame(width: w * 0.25)
                         .offset(x: w * 0.25)
                 }
@@ -232,8 +235,12 @@ struct QuotaWindowRow: View {
                 StatusDot(color: statusColor ?? dotColor, size: 7)
             }
 
+            // The bar carries the same severity as the row's dot. A monochrome
+            // bar drew a near-white slab across the panel in dark mode and said
+            // nothing the number hadn't already said; tinting it means the row
+            // can be read at a glance without parsing a percentage.
             UsageBar(fraction: quotaLeft, refreshing: refreshing, height: 6,
-                     thumbFraction: pace.timeLeftFraction)
+                     fill: dotColor, thumbFraction: pace.timeLeftFraction)
 
             VStack(spacing: 2) {
                 metaLine(left: leftText, right: pace.resetText)

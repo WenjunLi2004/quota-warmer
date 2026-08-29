@@ -11,11 +11,11 @@ struct OnboardingView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(DS.C.yellow).font(.system(size: 12))
                 Text("SETUP REQUIRED")
-                    .font(.system(size: 10, weight: .bold)).foregroundStyle(DS.C.yellow)
+                    .font(.system(size: 11, weight: .bold)).foregroundStyle(DS.C.yellow)
                 Spacer()
                 Button(action: dismiss) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(DS.C.textMuted)
                 }
                 .buttonStyle(.plain)
@@ -27,13 +27,13 @@ struct OnboardingView: View {
 
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 Text("Warmup needs Claude/Codex binaries in the app environment. Credentials are checked separately below.")
-                    .font(.system(size: 10)).foregroundStyle(DS.C.textSub)
+                    .font(.system(size: 11)).foregroundStyle(DS.C.textSub)
                     .fixedSize(horizontal: false, vertical: true)
 
                 if checking {
                     HStack(spacing: 6) {
                         ProgressView().scaleEffect(0.65).tint(DS.C.textMuted)
-                        Text("Checking…").font(.system(size: 10)).foregroundStyle(DS.C.textMuted)
+                        Text("Checking…").font(.system(size: 11)).foregroundStyle(DS.C.textMuted)
                     }
                 } else {
                     VStack(spacing: 4) {
@@ -49,13 +49,13 @@ struct OnboardingView: View {
             HStack {
                 Button(action: recheck) {
                     Label("Re-check", systemImage: "arrow.clockwise")
-                        .font(.system(size: 10)).foregroundStyle(DS.C.textMuted)
+                        .font(.system(size: 11)).foregroundStyle(DS.C.textMuted)
                 }
                 .buttonStyle(.plain)
                 Spacer()
                 Button(action: dismiss) {
                     Text("Dismiss")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                         .padding(.horizontal, 10).padding(.vertical, 5)
                         .background(DS.C.surface, in: RoundedRectangle(cornerRadius: DS.R.sm))
                         .foregroundStyle(DS.C.text)
@@ -79,14 +79,14 @@ struct OnboardingView: View {
             Spacer()
             if found {
                 Label("Found", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 10)).foregroundStyle(DS.C.green)
+                    .font(.system(size: 11)).foregroundStyle(DS.C.green)
             } else {
                 HStack(spacing: 4) {
                     Label("Not found", systemImage: "xmark.circle.fill")
-                        .font(.system(size: 10)).foregroundStyle(DS.C.red)
+                        .font(.system(size: 11)).foregroundStyle(DS.C.red)
                     Button("install →") { openInstallPage(for: tool) }
                         .buttonStyle(.plain)
-                        .font(.system(size: 10)).foregroundStyle(DS.C.blue)
+                        .font(.system(size: 11)).foregroundStyle(DS.C.blue)
                 }
             }
         }

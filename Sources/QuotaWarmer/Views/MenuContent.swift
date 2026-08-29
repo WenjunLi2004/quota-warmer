@@ -137,7 +137,7 @@ struct MenuContent: View {
             if let warning = appState.watcherStatusText {
                 HStack(spacing: 5) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                     Text(warning)
                         .font(.system(size: 11.5, weight: .semibold))
                 }
@@ -191,8 +191,19 @@ struct MenuContent: View {
             let state = appState.state(for: tool)
             if state.isFetchingQuota { return "Updating..." }
             if let next = state.nextRefreshAt { return "Next update in \(compactCountdown(next))" }
+            return "Idle"
         }
-        return "Idle"
+        // Overview reports the app as a whole. It used to fall through to a flat
+        // "Idle" here — on the one screen where that was least true, since
+        // polling continues on its own schedule whichever tab is open.
+        if appState.isRefreshing { return "Updating..." }
+        let soonest = ToolID.allCases
+            .map { appState.state(for: $0) }
+            .filter(\.isMonitored)
+            .compactMap(\.nextRefreshAt)
+            .min()
+        guard let soonest else { return "Idle" }
+        return "Next update in \(compactCountdown(soonest))"
     }
 
     private var isFooterRefreshing: Bool {

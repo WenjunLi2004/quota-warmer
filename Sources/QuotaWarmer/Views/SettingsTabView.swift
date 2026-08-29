@@ -93,7 +93,7 @@ struct SettingsTabView: View {
                             Image(systemName: "info.circle")
                                 .font(.system(size: 12)).foregroundStyle(DS.C.textSub).frame(width: 20)
                             Text(status)
-                                .font(.system(size: 9.5)).foregroundStyle(DS.C.textMuted)
+                                .font(.system(size: 11)).foregroundStyle(DS.C.textMuted)
                                 .fixedSize(horizontal: false, vertical: true)
                             Spacer(minLength: 0)
                         }
@@ -167,12 +167,12 @@ struct SettingsTabView: View {
                             Text("QuotaWarmer")
                                 .font(.system(size: 12.5, weight: .semibold)).foregroundStyle(DS.C.text)
                             Text("v1.0  ·  macOS 14+")
-                                .font(.system(size: 10)).foregroundStyle(DS.C.textMuted)
+                                .font(.system(size: 11)).foregroundStyle(DS.C.textMuted)
                         }
                         Spacer()
                         if appState.updateInfo != nil {
                             Text("update available")
-                                .font(.system(size: 9, weight: .medium))
+                                .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(DS.C.accent(.claude))
                                 .padding(.horizontal, 6).padding(.vertical, 3)
                                 .background(DS.C.accent(.claude).opacity(0.10), in: Capsule())
@@ -252,7 +252,7 @@ struct SettingsTabView: View {
 
     private var settingsHeader: some View {
         Text("SETTINGS")
-            .font(.system(size: 10, weight: .bold))
+            .font(.system(size: 11, weight: .bold))
             .foregroundStyle(DS.C.textMuted)
             .padding(.horizontal, DS.Space.lg)
             .padding(.top, DS.Space.lg)
@@ -262,7 +262,7 @@ struct SettingsTabView: View {
     private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(title)
-                .font(.system(size: 9, weight: .bold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(DS.C.textMuted)
                 .padding(.horizontal, DS.Space.lg)
                 .padding(.top, DS.Space.md)
@@ -293,7 +293,7 @@ struct SettingsTabView: View {
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(DS.C.text)
                 Text(subtitle)
-                    .font(.system(size: 9.5))
+                    .font(.system(size: 11))
                     .foregroundStyle(DS.C.textMuted)
             }
             Spacer()
@@ -306,10 +306,10 @@ struct SettingsTabView: View {
     private func privacyLine(_ title: String, _ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(DS.C.text)
             Text(detail)
-                .font(.system(size: 9))
+                .font(.system(size: 11))
                 .foregroundStyle(DS.C.textMuted)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -349,7 +349,7 @@ struct SettingsTabView: View {
                 let isSelected = selected.wrappedValue == opt.value
                 Button(action: { selected.wrappedValue = opt.value; onChange() }) {
                     Text(opt.label)
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .padding(.horizontal, 8).padding(.vertical, 4)
                         .background(
                             isSelected ? DS.C.surface : Color.clear,

@@ -30,10 +30,12 @@ struct ToolTabView: View {
                     .resizable()
                     .renderingMode(.template)
                     .scaledToFit()
-                    .frame(width: 24, height: 24)
+                    .frame(width: 18, height: 18)
                     .foregroundStyle(DS.C.text)
+                // A page title, not a banner: 22pt bold here left this tab on a
+                // different type scale from the overview it is reached from.
                 Text(toolState.tool.shortName)
-                    .font(.system(size: 22, weight: .bold))
+                    .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(DS.C.text)
             }
             Spacer()
@@ -104,7 +106,7 @@ struct ToolTabView: View {
                 Spacer(minLength: 8)
                 if toolState.isFetchingTokenUsage {
                     Image(systemName: "hourglass")
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(DS.C.textMuted)
                 }
             }

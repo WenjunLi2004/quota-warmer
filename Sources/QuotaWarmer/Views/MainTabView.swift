@@ -9,15 +9,15 @@ struct MainTabView: View {
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 11) {
                 header
                 if !outcomeTools.isEmpty { statusCard }
                 providerList
                 historySection
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 18)
-            .padding(.bottom, 16)
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
         }
         .background(DS.C.bg)
     }
@@ -65,7 +65,7 @@ struct MainTabView: View {
     private func providerRow(_ tool: ToolID) -> some View {
         let state = appState.state(for: tool)
         let collapsed = collapsedTools.contains(tool)
-        return VStack(alignment: .leading, spacing: collapsed ? 0 : 16) {
+        return VStack(alignment: .leading, spacing: collapsed ? 0 : 12) {
             // Tool name on the left, the same mode / refresh / pin controls on
             // the right (where the reference shows the plan badge).
             HStack(spacing: 8) {
@@ -118,8 +118,8 @@ struct MainTabView: View {
                           resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
             }
         }
-        .padding(.horizontal, collapsed ? 12 : 14)
-        .padding(.vertical, collapsed ? 9 : 13)
+        .padding(.horizontal, 12)
+        .padding(.vertical, collapsed ? 8 : 11)
         .dsCard()
     }
 
@@ -190,10 +190,10 @@ struct MainTabView: View {
                     Text("History").dsSectionLabel()
                     Spacer()
                     Text("\(appState.history.count)")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(DS.C.textMuted)
                     Image(systemName: historyExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(DS.C.textMuted)
                 }
                 .contentShape(Rectangle())
@@ -203,7 +203,7 @@ struct MainTabView: View {
             if historyExpanded {
                 if appState.history.isEmpty {
                     Text("No events yet")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundStyle(DS.C.textMuted)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, DS.Space.lg)
@@ -216,8 +216,8 @@ struct MainTabView: View {
                 }
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 13)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
         .dsCard()
     }
 
@@ -242,8 +242,8 @@ struct MainTabView: View {
                 outcomeRow(tool)
             }
         }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 11)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .dsCard()
     }
@@ -251,23 +251,22 @@ struct MainTabView: View {
     private func outcomeRow(_ tool: ToolID) -> some View {
         let state = appState.state(for: tool)
         let info = outcomeInfo(state.lastWarmupOutcome, mode: state.mode)
-        return HStack(alignment: .top, spacing: 9) {
+        // One row per tool rather than a stacked name-over-message block: the
+        // name is short enough to sit inline, which halves the card's height.
+        return HStack(spacing: 7) {
             StatusDot(color: info.color, size: 7)
-                .padding(.top, 3)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(tool.shortName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(DS.C.text)
-                Text(info.message)
-                    .font(.system(size: 11))
-                    .foregroundStyle(DS.C.textSub)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text(tool.shortName)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(DS.C.text)
+            Text(info.message)
+                .font(.system(size: 11.5))
+                .foregroundStyle(DS.C.textSub)
+                .lineLimit(2)
             Spacer(minLength: 6)
             if info.showWarm {
                 Button(action: { appState.activate(tool) }) {
                     Text("Warm")
-                        .font(.system(size: 10.5, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .padding(.horizontal, 12)
                         .frame(height: 24)
                         .background(DS.C.accent(tool), in: Capsule())
@@ -282,22 +281,22 @@ struct MainTabView: View {
 
     private func outcomeInfo(_ outcome: WarmupOutcome, mode: ToolMode) -> (color: Color, message: String, showWarm: Bool) {
         switch outcome {
+        // Kept to one short line each: this card sits directly above the window
+        // rows, so anything longer wrapped and pushed the panel into scrolling
+        // for information the rows below already carry.
         case .none:
             if mode == .autoWarm {
-                return (DS.C.green, "Auto-warm on — the next fresh window will be claimed automatically.", false)
+                return (DS.C.green, "Waiting for the next window", false)
             }
-            return (DS.C.textMuted, "No warm-up yet.", false)
+            return (DS.C.textMuted, "No warm-up yet", false)
         case .pending:
-            return (DS.C.yellow, "Warm-up sent — verifying the window opened…", false)
-        case .confirmed(let at, let resetAt):
-            var message = "Window claimed at \(shortClock(at))"
-            if let resetAt, resetAt > Date() {
-                let seconds = Int(resetAt.timeIntervalSinceNow)
-                message += " · resets in \(seconds / 3600)h \((seconds % 3600) / 60)m"
-            }
-            return (DS.C.green, message, false)
+            return (DS.C.yellow, "Verifying the window opened…", false)
+        case .confirmed(let at, _):
+            // The reset countdown is already on the Session row below; repeating
+            // it here was what pushed this line onto a second row.
+            return (DS.C.green, "Claimed at \(shortClock(at))", false)
         case .failed(_, let reason):
-            return (DS.C.red, "Warm-up failed: \(reason)", true)
+            return (DS.C.red, "Failed: \(reason)", true)
         }
     }
 
@@ -323,7 +322,7 @@ struct HistoryRow: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DS.C.text)
                 Text(event.detail)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(DS.C.textMuted)
                     .lineLimit(2)
             }

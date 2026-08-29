@@ -1,19 +1,6 @@
 import AppKit
 import SwiftUI
 
-extension Color {
-    /// Hex literal initializer, e.g. `Color(hex: 0xF8FAFC)`.
-    init(hex: UInt32) {
-        self.init(
-            .sRGB,
-            red: Double((hex >> 16) & 0xFF) / 255.0,
-            green: Double((hex >> 8) & 0xFF) / 255.0,
-            blue: Double(hex & 0xFF) / 255.0,
-            opacity: 1.0
-        )
-    }
-}
-
 /// Design tokens, drawn from the system palette rather than hand-picked hexes.
 ///
 /// The previous values were a fixed light-mode web palette (Tailwind slate),
@@ -40,7 +27,6 @@ enum DS {
         // Borders
         static let border      = Color(nsColor: .separatorColor)
         static let borderSoft  = Color(nsColor: .separatorColor).opacity(0.6)
-        static let borderFocus = Color(nsColor: .separatorColor)
 
         // Text
         static let text        = Color.primary
@@ -90,7 +76,10 @@ enum DS {
     static let sidebarWidth: CGFloat = 34
     static let contentWidth: CGFloat = 320
     static let totalWidth:   CGFloat = sidebarWidth + contentWidth
-    static let totalHeight: CGFloat = 500
+    // Tall enough to show both providers' windows plus history without
+    // scrolling — the panel exists to be read in one glance, and a scroll bar
+    // hides exactly the row (a depleted weekly window) worth noticing.
+    static let totalHeight: CGFloat = 560
 
     // MARK: - Typography
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
