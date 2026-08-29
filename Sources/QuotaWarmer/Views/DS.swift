@@ -40,6 +40,15 @@ enum DS {
         static let red    = Color(nsColor: .systemRed)
         static let blue   = Color(nsColor: .systemBlue)
 
+        // Usage-bar fills. A healthy window draws in neutral graphite, not
+        // green: colour here means "look at this", and a panel where every bar
+        // is coloured spends that signal on windows that are perfectly fine.
+        // Softened against the system hues, which read as alarm lights at full
+        // strength across a bar this wide — most visibly in light mode.
+        static let meterNormal   = Color.primary.opacity(0.55)
+        static let meterLow      = Color(nsColor: .systemOrange).opacity(0.80)
+        static let meterCritical = Color(nsColor: .systemRed).opacity(0.80)
+
         /// Per-tool brand accent. Kept as-is to preserve product identity.
         static func accent(_ tool: ToolID) -> Color {
             tool == .claude

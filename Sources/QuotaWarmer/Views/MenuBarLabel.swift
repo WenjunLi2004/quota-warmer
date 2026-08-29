@@ -103,12 +103,17 @@ enum MenuBarStatus {
         return "\(compactTime(time)) · \(percent)%"
     }
 
-    private static func nsStatusColor(for state: ToolState, appState: AppState) -> NSColor {
+    /// Nil while the tool is healthy and warming. A badge that is green
+    /// essentially always is noise pinned to the menu bar — and it sits on the
+    /// corner of the glyph, so it costs legibility for a signal that never
+    /// changes. It earns the space only when it means "this one needs you".
+    /// Monitor mode keeps its dot: "watching, never warming" is worth a reminder.
+    private static func nsStatusColor(for state: ToolState, appState: AppState) -> NSColor? {
         // Off / globally-paused tools get a neutral gray dot so they no longer
         // look like an error (which is red).
         if appState.globalPassive || !state.isMonitored { return .systemGray }
         if state.sourceHealth == .healthy && state.freshness == .fresh {
-            return state.mode == .monitor ? .systemBlue : .systemGreen
+            return state.mode == .monitor ? .systemBlue : nil
         }
         if state.sourceHealth == .authFailure || state.sourceHealth == .unavailable { return .systemRed }
         return .systemYellow
@@ -143,7 +148,8 @@ enum MenuBarStatus {
 private enum MenuBarComposer {
     struct Item {
         let assetName: String
-        let dotColor: NSColor
+        /// Nil draws no badge at all — see `MenuBarStatus.nsStatusColor`.
+        let dotColor: NSColor?
         let text: String
         let textColor: NSColor
         let dimmed: Bool
@@ -208,15 +214,18 @@ private enum MenuBarComposer {
             logoRect.fill(using: .sourceAtop)
         }
 
-        // Status dot at the glyph's bottom-right corner.
-        let dot: CGFloat = 5
-        let dotRect = NSRect(x: logoRect.maxX - dot + 1, y: logoRect.minY - 0.5, width: dot, height: dot)
-        item.dotColor.withAlphaComponent(alpha).setFill()
-        NSBezierPath(ovalIn: dotRect).fill()
-        NSColor.controlBackgroundColor.withAlphaComponent(0.9 * alpha).setStroke()
-        let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: -0.5, dy: -0.5))
-        ring.lineWidth = 0.75
-        ring.stroke()
+        // Status badge on the glyph's bottom-right corner — drawn only when the
+        // tool actually needs attention.
+        if let dotColor = item.dotColor {
+            let dot: CGFloat = 5
+            let dotRect = NSRect(x: logoRect.maxX - dot + 1, y: logoRect.minY - 0.5, width: dot, height: dot)
+            dotColor.withAlphaComponent(alpha).setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+            NSColor.controlBackgroundColor.withAlphaComponent(0.9 * alpha).setStroke()
+            let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: -0.5, dy: -0.5))
+            ring.lineWidth = 0.75
+            ring.stroke()
+        }
 
         guard !item.text.isEmpty else { return }
         let attrs: [NSAttributedString.Key: Any] = [

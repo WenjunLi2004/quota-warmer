@@ -240,7 +240,7 @@ struct QuotaWindowRow: View {
             // nothing the number hadn't already said; tinting it means the row
             // can be read at a glance without parsing a percentage.
             UsageBar(fraction: quotaLeft, refreshing: refreshing, height: 6,
-                     fill: dotColor, thumbFraction: pace.timeLeftFraction)
+                     fill: barColor, thumbFraction: pace.timeLeftFraction)
 
             VStack(spacing: 2) {
                 metaLine(left: leftText, right: pace.resetText)
@@ -265,16 +265,40 @@ struct QuotaWindowRow: View {
         }
     }
 
-    /// Pace-based: red when spending faster than time allows, green when on/ahead
-    /// of pace, gray when there's no live quota.
+    /// How much room is left, and nothing else.
+    ///
+    /// This used to key off `pace.isBehind` whenever a reset time existed, so a
+    /// window with 87% of its quota intact went red for being a few percent
+    /// ahead of the clock, while a genuinely depleted one went red for a
+    /// different reason. One colour, two unrelated meanings, alternating down
+    /// the panel. Pace still has a voice — the "6% short / runs out in" line
+    /// says it in words, where it can't be mistaken for an alarm.
+    private enum Severity { case ok, low, critical }
+
+    private var severity: Severity {
+        if quotaLeft < 0.15 { return .critical }
+        if quotaLeft < 0.35 { return .low }
+        return .ok
+    }
+
     private var dotColor: Color {
         guard hasMetric else { return DS.C.textMuted }
-        if pace.timeLeftFraction != nil {
-            return pace.isBehind ? DS.C.red : DS.C.green
+        switch severity {
+        case .ok:       return DS.C.green
+        case .low:      return DS.C.yellow
+        case .critical: return DS.C.red
         }
-        if quotaLeft >= 0.5 { return DS.C.green }
-        if quotaLeft >= 0.25 { return DS.C.yellow }
-        return DS.C.red
+    }
+
+    /// The bar stays neutral while a window is healthy, so the one bar that does
+    /// carry colour is the one worth looking at.
+    private var barColor: Color {
+        guard hasMetric else { return DS.C.textMuted.opacity(0.5) }
+        switch severity {
+        case .ok:       return DS.C.meterNormal
+        case .low:      return DS.C.meterLow
+        case .critical: return DS.C.meterCritical
+        }
     }
 }
 
