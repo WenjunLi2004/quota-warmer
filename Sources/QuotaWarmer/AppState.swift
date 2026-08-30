@@ -1083,11 +1083,16 @@ final class AppState: ObservableObject {
         if let providerError = error as? QuotaProviderError {
             switch providerError {
             case .credentialInteractionRequired:
-                clearQuotaBackoff(for: state)
                 clearAuthRetry(for: state)
                 state.sourceHealth = .authFailure
                 state.authStatus = .missing
                 addHistory(tool: state.tool, kind: .authFailure, title: "Claude access needs approval", detail: message)
+                // Only a click can grant Keychain access — no amount of polling
+                // makes this resolve itself. Retrying on the normal five-minute
+                // cadence just lines up approval dialogs, which is exactly the
+                // pattern that made this feel broken. Refresh forces through the
+                // backoff, so the user is never locked out of retrying.
+                _ = applyQuotaBackoff(for: state, retryAfter: 30 * 60)
             case .cliRefreshRequired:
                 clearQuotaBackoff(for: state)
                 clearAuthRetry(for: state)
@@ -1103,11 +1108,23 @@ final class AppState: ObservableObject {
                 state.authStatus = .failed
                 addHistory(tool: state.tool, kind: .authFailure, title: "Authorization failed", detail: message)
             case .missingCredentials:
-                clearQuotaBackoff(for: state)
                 state.sourceHealth = .authFailure
                 state.authStatus = .missing
                 addHistory(tool: state.tool, kind: .authFailure, title: "Credentials missing", detail: message)
+                let attemptsBefore = state.authRetryAttempts
                 scheduleClaudeAuthRecheckIfNeeded(for: state, reason: message)
+                if state.authRetryAttempts == attemptsBefore {
+                    // The quick rechecks are spent and nothing is pending. A
+                    // five-minute tick does not make a missing credential
+                    // appear, and every attempt is another chance for the
+                    // Keychain to raise its dialog — so stand down until either
+                    // the backoff elapses or the user hits Refresh.
+                    _ = applyQuotaBackoff(for: state, retryAfter: 30 * 60)
+                } else {
+                    // A recheck is scheduled; a backoff here would silently
+                    // cancel it, since the recheck refreshes without forcing.
+                    clearQuotaBackoff(for: state)
+                }
             case .rateLimited(_, let retryAfter):
                 clearAuthRetry(for: state)
                 let retryAt = applyQuotaBackoff(for: state, retryAfter: retryAfter)

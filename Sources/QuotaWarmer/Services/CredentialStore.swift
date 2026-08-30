@@ -18,6 +18,19 @@ final class CredentialStore {
     }
 
     private func claudeCredential(allowsUserInteraction: Bool) throws -> Credential {
+        // A token the user issued with `claude setup-token` outranks everything
+        // else. Every other source ends up back at Claude Code's Keychain item,
+        // and that item is rewritten on each token rotation — a rewrite installs
+        // a fresh ACL, which silently discards the "Always Allow" grant the user
+        // gave us. Approving it is therefore not a one-time cost but a recurring
+        // one, roughly every eight hours, forever. An item we create ourselves
+        // has no such problem: we own its ACL, and nothing else rewrites it.
+        adoptLongLivedTokenFileIfPresent()
+        if let stored = longLivedClaudeToken() {
+            DiagnosticLogger.append("claude_credential_source=long-lived prompt=no")
+            return stored
+        }
+
         // Claude Code owns its Keychain item, so every read of it can raise the
         // macOS approval dialog — the grant does not reliably survive the CLI
         // rewriting the item on each ~8h token rotation. Mirror the still-valid
@@ -95,10 +108,12 @@ final class CredentialStore {
     func credentialSourceSummary(for tool: ToolID) -> String {
         switch tool {
         case .claude:
-            return (claudeKeychainServices().map { "Keychain \($0)" } + [
-                "env CLAUDE_CODE_OAUTH_TOKEN",
-                "~/.claude/.credentials.json"
-            ]).joined(separator: ", ")
+            // Leads with the hand-off path, so a "credentials missing" message
+            // also tells the user the one way to stop the approval dialog.
+            return (["~/.config/quotawarmer/claude-token (claude setup-token)"]
+                + claudeKeychainServices().map { "Keychain \($0)" }
+                + ["env CLAUDE_CODE_OAUTH_TOKEN", "~/.claude/.credentials.json"]
+            ).joined(separator: ", ")
         case .codex:
             return [
                 "$CODEX_HOME/auth.json",
@@ -132,6 +147,83 @@ final class CredentialStore {
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess else { return nil }
         return item as? Data
+    }
+
+    // MARK: - Long-lived token (the dialog-free path)
+
+    /// Holds a token from `claude setup-token`. Like the mirror below it is an
+    /// item QuotaWarmer creates, so reads never prompt — but unlike the mirror
+    /// it carries no expiry, so it does not lapse back to Claude Code's item
+    /// every time that token rotates.
+    private static let claudeLongLivedService = "com.quotawarmer.app.claude-long-lived-token"
+
+    /// Where the user hands the token over, once:
+    /// `claude setup-token > ~/.config/quotawarmer/claude-token`
+    private var longLivedTokenFileURL: URL {
+        fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/quotawarmer/claude-token")
+    }
+
+    /// Moves a handed-over token into the Keychain and deletes the file, so the
+    /// token spends only moments on disk in the clear and every later read comes
+    /// from an item we own.
+    private func adoptLongLivedTokenFileIfPresent() {
+        let url = longLivedTokenFileURL
+        guard fileManager.fileExists(atPath: url.path),
+              let raw = try? String(contentsOf: url, encoding: .utf8) else { return }
+        if storeLongLivedClaudeToken(raw) {
+            try? fileManager.removeItem(at: url)
+            DiagnosticLogger.append("claude_long_lived_token adopted=yes source=file")
+        } else {
+            DiagnosticLogger.append("claude_long_lived_token adopted=no source=file")
+        }
+    }
+
+    func longLivedClaudeToken() -> Credential? {
+        guard let data = keychainPassword(service: Self.claudeLongLivedService),
+              let token = String(data: data, encoding: .utf8)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else { return nil }
+        return Credential(
+            accessToken: token,
+            // Deliberately no refresh token and no expiry: this token exists to
+            // outlive the CLI's rotating one, and ageing it out would send every
+            // read back to the dialog it was issued to avoid.
+            refreshToken: nil,
+            accountID: nil,
+            source: "long-lived token",
+            expiresAt: nil
+        )
+    }
+
+    @discardableResult
+    func storeLongLivedClaudeToken(_ token: String) -> Bool {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return false }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.claudeLongLivedService
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var insert = query
+            insert.merge(attributes) { current, _ in current }
+            return SecItemAdd(insert as CFDictionary, nil) == errSecSuccess
+        }
+        return status == errSecSuccess
+    }
+
+    func clearLongLivedClaudeToken() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.claudeLongLivedService
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 
     /// Generic-password item created and owned by QuotaWarmer. Because this
