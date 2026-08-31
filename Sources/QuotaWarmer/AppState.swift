@@ -716,6 +716,22 @@ final class AppState: ObservableObject {
         guard state.sourceHealth == .healthy,
               state.canAutoWarmFromSnapshot,
               let snapshot = state.quotaSnapshot else {
+            // The live quota check didn't succeed — normally we'd just wait for
+            // it to recover. But that check is a *gate* here, not only a
+            // display: while it keeps failing, auto-warm never even attempts a
+            // command, so a persistent server-side rate limit on the
+            // quota-check endpoint silently stalls the thing this app exists to
+            // do, not just its percentage readout.
+            //
+            // Fall back to the same reasoning the once-a-day morning-catchup
+            // path already trusts: real local CLI activity on disk, independent
+            // of any network call. If nothing has touched this tool's logs
+            // within its own window duration, no window can possibly still be
+            // open, so it's safe to warm regardless of what the live check
+            // says (or fails to say).
+            if scanner.windowStartTime(for: tool) == nil {
+                _ = await triggerWarmup(tool: tool, mode: "auto-catchup")
+            }
             return
         }
         guard AutoWarmDedup.shouldWarm(
@@ -969,7 +985,7 @@ final class AppState: ObservableObject {
 
     private func historyKind(forWarmupMode mode: String) -> HistoryKind {
         switch mode {
-        case "auto", "scheduled", "scheduled-catchup":
+        case "auto", "scheduled", "scheduled-catchup", "auto-catchup":
             return .autoWarmup
         default:
             return .manualWarmup
@@ -984,6 +1000,8 @@ final class AppState: ObservableObject {
             return "Scheduled warmup sent"
         case "scheduled-catchup":
             return "Scheduled catch-up warmup sent"
+        case "auto-catchup":
+            return "Catch-up warmup sent (quota check unavailable)"
         default:
             return "Manual warmup sent"
         }
