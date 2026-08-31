@@ -475,10 +475,34 @@ final class AppState: ObservableObject {
                 // then this command's regular post-warm fetch reads it again.
                 state.isFetchingQuota = false
                 _ = await triggerWarmup(tool: .claude, mode: "auto")
+            } else if allowAutomaticWarmup {
+                // A live quota fetch failing here (rate-limited, unreachable,
+                // whatever) used to mean auto-warm just waited for the next
+                // regular poll — the same wait, every five minutes, for as
+                // long as the check stays broken. Reaching this point only via
+                // the scheduler's own hourly backoff timer (attemptAutomaticWarmup's
+                // equivalent branch) meant the very first retry after
+                // installing this fallback could be up to an hour away. Give
+                // it the same chance on every regular tick instead.
+                state.isFetchingQuota = false
+                await attemptActivityFallbackWarmup(for: tool)
             }
         }
 
         state.isFetchingQuota = false
+    }
+
+    /// Real local CLI activity on disk, independent of any network call — the
+    /// same reasoning the once-a-day morning-catchup path already trusts. If
+    /// nothing has touched this tool's logs within its own window duration, no
+    /// window can possibly still be open, so it's safe to warm regardless of
+    /// what the live quota check says or fails to say. This is what keeps a
+    /// persistent rate limit on the quota-check endpoint from also stalling
+    /// the thing this app exists to do.
+    private func attemptActivityFallbackWarmup(for tool: ToolID) async {
+        guard canAttemptManagedWarmup(for: tool),
+              scanner.windowStartTime(for: tool) == nil else { return }
+        _ = await triggerWarmup(tool: tool, mode: "auto-catchup")
     }
 
     private func refreshTokenUsage(for tool: ToolID) {
@@ -716,22 +740,7 @@ final class AppState: ObservableObject {
         guard state.sourceHealth == .healthy,
               state.canAutoWarmFromSnapshot,
               let snapshot = state.quotaSnapshot else {
-            // The live quota check didn't succeed — normally we'd just wait for
-            // it to recover. But that check is a *gate* here, not only a
-            // display: while it keeps failing, auto-warm never even attempts a
-            // command, so a persistent server-side rate limit on the
-            // quota-check endpoint silently stalls the thing this app exists to
-            // do, not just its percentage readout.
-            //
-            // Fall back to the same reasoning the once-a-day morning-catchup
-            // path already trusts: real local CLI activity on disk, independent
-            // of any network call. If nothing has touched this tool's logs
-            // within its own window duration, no window can possibly still be
-            // open, so it's safe to warm regardless of what the live check
-            // says (or fails to say).
-            if scanner.windowStartTime(for: tool) == nil {
-                _ = await triggerWarmup(tool: tool, mode: "auto-catchup")
-            }
+            await attemptActivityFallbackWarmup(for: tool)
             return
         }
         guard AutoWarmDedup.shouldWarm(
