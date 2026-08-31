@@ -991,7 +991,16 @@ final class AppState: ObservableObject {
 
     private func applyQuotaBackoff(for state: ToolState, retryAfter: TimeInterval?) -> Date {
         let baseDelay: TimeInterval = 5 * 60
-        let maxDelay: TimeInterval = 60 * 60
+        // A 1-hour ceiling looked reasonable for a transient rate limit, but
+        // this endpoint has stayed 429'd for 40+ hours at a stretch (likely our
+        // own six same-day reinstalls each firing an immediate check, stacked
+        // on the regular 5-minute poll). Polling an endpoint that's still
+        // clearly blocked every hour is at best wasted effort and at worst — if
+        // its limiter uses a sliding window — the thing keeping it blocked.
+        // 6 hours means far fewer pokes during an extended block; note that
+        // this only throttles the *quota-percentage* check — the actual window
+        // warm-up runs through the `claude` CLI directly and is unaffected.
+        let maxDelay: TimeInterval = 6 * 60 * 60
         let fallbackDelay = state.quotaBackoffDelay > 0
             ? min(state.quotaBackoffDelay * 2, maxDelay)
             : baseDelay
