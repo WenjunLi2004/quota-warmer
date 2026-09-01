@@ -18,8 +18,8 @@ targets:
         CFBundleDisplayName: QuotaWarmer
         CFBundleName: QuotaWarmer
         CFBundleIdentifier: com.quotawarmer.app
-        CFBundleShortVersionString: "1.6.3"
-        CFBundleVersion: "10"
+        CFBundleShortVersionString: "1.7.0"
+        CFBundleVersion: "11"
         LSUIElement: true
         NSHumanReadableCopyright: ""
         NSUserNotificationUsageDescription: "QuotaWarmer sends alerts when your 5h quota window is about to reset."

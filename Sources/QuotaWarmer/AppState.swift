@@ -286,6 +286,10 @@ final class AppState: ObservableObject {
             }
         }
 
+        // Drop the credential left behind by the withdrawn setup-token path
+        // before the first fetch, so an upgrading install never reads it again.
+        CredentialStore().purgeWithdrawnLongLivedToken()
+
         refreshAllActivity(allowAutomaticWarmup: false)
         startQuotaRefreshTimer()
         startUIRefreshTimer()
