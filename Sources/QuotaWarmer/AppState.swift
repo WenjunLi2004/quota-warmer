@@ -504,8 +504,24 @@ final class AppState: ObservableObject {
     /// persistent rate limit on the quota-check endpoint from also stalling
     /// the thing this app exists to do.
     private func attemptActivityFallbackWarmup(for tool: ToolID) async {
-        guard canAttemptManagedWarmup(for: tool),
-              scanner.windowStartTime(for: tool) == nil else { return }
+        guard canAttemptManagedWarmup(for: tool) else { return }
+
+        // Respect the window we already claimed. The normal path gets this from
+        // AutoWarmDedup; this one bypassed it and looked only at on-disk
+        // activity — but the warm-up runs `--ephemeral` from a temp directory
+        // and writes no session log, so that check answered "no activity"
+        // forever and re-warmed on every single poll. Observed doing exactly
+        // that to Codex every ~5 minutes for hours, burning real quota, while
+        // its own log line said the window was active with 3h+ left.
+        if let claimedUntil = state(for: tool).lastAutoWarmWindowEndsAt,
+           claimedUntil > Date() {
+            DiagnosticLogger.append(
+                "auto_warm_skipped_active_window tool=\(tool.rawValue) windowEndsAt=\(ISO8601DateFormatter().string(from: claimedUntil)) path=fallback"
+            )
+            return
+        }
+
+        guard scanner.windowStartTime(for: tool) == nil else { return }
         _ = await triggerWarmup(tool: tool, mode: "auto-catchup")
     }
 
