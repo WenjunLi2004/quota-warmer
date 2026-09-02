@@ -5,8 +5,11 @@
 一个小巧的 macOS 菜单栏应用,帮你把 Claude Code 和 Codex CLI 的 5 小时配额窗口一直"焐热"——它盯着你的滚动配额窗口,窗口一开就自动接手续上,不用你自己记着去用一下才能触发。
 
 <p align="center">
-  <!-- TODO: 替换成重新设计后的面板截图(浅色/深色各一张) -->
-  <img src="docs/images/quota-warmer-menu.png" alt="QuotaWarmer 菜单栏面板" width="560">
+  <img src="docs/images/panel-overview-light.png" alt="QuotaWarmer 总览面板,浅色" width="360">
+  <img src="docs/images/panel-overview-dark.png" alt="QuotaWarmer 总览面板,深色" width="360">
+</p>
+<p align="center">
+  <img src="docs/images/menu-bar.png" alt="QuotaWarmer 菜单栏显示" height="20">
 </p>
 
 默认只**监控**:实时看配额、在菜单栏显示每个工具的窗口状态。把某个工具切到 **Auto-warm**,它就会在窗口一开的瞬间,通过你本机已登录的 CLI 发一条最小化的预热命令,然后再确认一遍窗口是不是真的开了。
@@ -96,9 +99,13 @@ xcodebuild -project QuotaWarmer.xcodeproj -scheme QuotaWarmer build
 
 这里的每个 DMG 都是这个仓库自己的 `release-unsigned.yml`,在 GitHub 的 macOS runner 上、从打了 tag 的那个具体 commit 编译出来的——不是手工攒的。想核实某个 release 对应哪一份看得见的源码:把那个 tag 的 `project.yml` 和[上游 `main`](https://github.com/bcanozgur/quota-warmer/compare/main...WenjunLi2004:quota-warmer:main) 对比一下,应该只有版本号不一样;再核对下载的 DMG 的 SHA-256 和同一个 release 里发布的 `.sha256` 文件是否一致。
 
-## 配额查询卡住了怎么办
+## 两个值得知道的取舍
 
-Anthropic 的用量查询接口,在短时间内被打得太频繁(比如反复重装几次)之后,可能会连续限流好几个小时。接口没恢复期间,菜单栏那个工具的百分比会显示不出来——但自动续窗口这件事在底层还在正常工作,靠的是本地活动记录这条后备信号(见[工作原理](#工作原理))。不用做任何操作,等接口自己恢复,百分比显示也会跟着自动恢复。
+**配额百分比偶尔会弹出钥匙串授权框。** 要拿到实时百分比,唯一办法是读 Claude Code 自己存的凭据;而 macOS 的"始终允许"授权,扛不过 Claude Code 每次轮换 OAuth 令牌(大约每 8 小时一次)对这个条目的重写——所以弹窗大概率会按这个周期反复出现。QuotaWarmer 会在两次轮换之间把令牌镜像到自己的钥匙串条目里,专门用来减少弹窗频率,但没法完全消除。如果弹窗比看到实时百分比更让你烦,把这个工具切成 **Monitor** 或 **Off** 就行——自动续期本身直接调用 CLI,完全不需要这一步。
+
+**`claude setup-token` 生成的长期令牌在这里用不了。** 之前试过这条路,想法是"app 自己拥有的钥匙串条目不需要重新授权"——这个逻辑没错,但 Anthropic 的用量查询接口(`/api/oauth/usage`)会直接拒绝这种类型的令牌,报 429,和普通的限流长得一模一样。表面上看就像接口被打爆了,实际上只是凭据类型不对,等多久都没用。如果配额百分比连续好几个刷新周期都显示不出来、也没有限流提示自己消失,先查这个——解法是换回 Claude Code 正常的 OAuth 凭据,不是多等一会儿。
+
+另外:如果实时配额查询是因为真正短暂的原因掉线了(网络抖动、真实的临时限流),自动续期不会干等它恢复——会退而求其次去看本地 CLI 活动记录来判断窗口要不要续(见[工作原理](#工作原理)),所以单是百分比显示不出来,不会连累这个 app 真正该干的事。
 
 ## 项目结构
 

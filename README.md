@@ -5,8 +5,11 @@
 A compact macOS menu bar app that keeps your Claude Code and Codex CLI quota windows warm — it watches your rolling 5-hour windows and, when you ask it to, claims a fresh one the moment it opens instead of waiting for you to remember.
 
 <p align="center">
-  <!-- TODO: replace with a current screenshot of the redesigned panel (light + dark) -->
-  <img src="docs/images/quota-warmer-menu.png" alt="QuotaWarmer menu bar popover" width="560">
+  <img src="docs/images/panel-overview-light.png" alt="QuotaWarmer overview panel, light" width="360">
+  <img src="docs/images/panel-overview-dark.png" alt="QuotaWarmer overview panel, dark" width="360">
+</p>
+<p align="center">
+  <img src="docs/images/menu-bar.png" alt="QuotaWarmer menu bar readout" height="20">
 </p>
 
 By default it only **monitors**: it watches live quota snapshots and shows each provider's window in the menu bar. Switch a tool to **Auto-warm** and it also sends a minimal warm-up command through your own logged-in CLI the instant a fresh window opens, then verifies the window actually started.
@@ -52,6 +55,7 @@ Local activity is read from:
 
 These logs both give the UI display context and, since they reflect real usage rather than a network call, back up the auto-warm decision when the live API can't.
 
+
 ## Requirements
 
 | Dependency | Requirement |
@@ -96,9 +100,13 @@ xcodebuild -project QuotaWarmer.xcodeproj -scheme QuotaWarmer build
 
 Every DMG here is built by this repo's own `release-unsigned.yml`, on GitHub's macOS runners, from the exact tagged commit — never assembled by hand. To check a given release traces back to a specific, readable commit: compare that tag's `project.yml` against [upstream `main`](https://github.com/bcanozgur/quota-warmer/compare/main...WenjunLi2004:quota-warmer:main) (the only difference should be the version string), and check the downloaded DMG's SHA-256 against the `.sha256` file published in the same release.
 
-## Recovering From a Stuck Quota Check
+## Two Trade-offs Worth Knowing About
 
-Anthropic's usage-check endpoint can stay rate-limited for many hours after a burst of requests (repeated reinstalls, for instance). While it's down, the menu bar shows no percentage for that tool — but auto-warm keeps working underneath, using local activity as its fallback signal (see [How It Works](#how-it-works)). No action is needed; the percentage display recovers on its own once the endpoint does.
+**The quota percentage can occasionally ask for Keychain access.** Reading Claude Code's own stored credential is the only way to get a live percentage, and macOS's "Always Allow" grant on that item does not survive Claude Code rewriting it on each OAuth token rotation (roughly every 8 hours) — so the approval dialog can reappear on that same cadence. QuotaWarmer mirrors the token into its own Keychain item between rotations specifically to cut down how often this happens, but it can't eliminate it entirely. If the prompt bothers you more than the live percentage is worth, set that tool to **Monitor** or **Off** — auto-warm itself runs the CLI directly and doesn't need this at all.
+
+**A long-lived token from `claude setup-token` will not work here.** It was tried, on the theory that an app-owned Keychain item never needs re-approval — true, but Anthropic's usage-check endpoint (`/api/oauth/usage`) rejects that token type outright, with a 429 that's indistinguishable from ordinary rate-limiting. It looks exactly like the endpoint being overloaded; it's really just the wrong kind of credential, and no amount of waiting fixes it. If the quota percentage is stuck showing nothing for more than a few refresh cycles with no rate-limit message clearing on its own, this is the first thing to check — the fix is reading Claude Code's normal OAuth credential instead, not a longer wait.
+
+Separately: if the live quota check does go down for a genuine, temporary reason (network blip, a real transient rate limit), auto-warm doesn't wait for it to recover — it falls back to local CLI activity on disk to decide whether a window still needs claiming (see [How It Works](#how-it-works)), so a percentage outage alone doesn't stall the thing this app exists to do.
 
 ## Project Structure
 
