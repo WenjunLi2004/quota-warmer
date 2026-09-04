@@ -1,4 +1,5 @@
 import Foundation
+import CFNetwork
 
 enum WarmupError: LocalizedError {
     case cliNotFound(String)
@@ -340,7 +341,42 @@ class WarmupRunner {
             components.append(existing)
         }
         env["PATH"] = uniquePath(components).joined(separator: ":")
+
+        // QuotaWarmer is launched by launchd, not a login shell, so it never
+        // sees a proxy that's only exported from .zshrc — and `zsh -lc` (login
+        // but non-interactive) doesn't source .zshrc either, so the warm-up
+        // command inherits none of it. Read the same system proxy macOS itself
+        // uses (Clash/Surge/etc. in "system proxy" mode write here via
+        // SystemConfiguration), so the CLI's own network stack can reach the
+        // API the same way a normal Terminal session would. Never overrides an
+        // explicitly-set value, and does nothing when no system proxy is on.
+        for (key, value) in Self.systemProxyEnvironment() where env[key] == nil {
+            env[key] = value
+        }
         return env
+    }
+
+    /// HTTP(S)_PROXY derived from macOS's system proxy settings (System
+    /// Settings > Network > Proxies, or whatever a proxy app like Clash wrote
+    /// there in "system proxy" mode). Empty when no such proxy is enabled.
+    private static func systemProxyEnvironment() -> [String: String] {
+        guard let settings = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
+            return [:]
+        }
+        var result: [String: String] = [:]
+        if (settings[kCFNetworkProxiesHTTPEnable as String] as? Int) == 1,
+           let host = settings[kCFNetworkProxiesHTTPProxy as String] as? String, !host.isEmpty,
+           let port = settings[kCFNetworkProxiesHTTPPort as String] as? Int {
+            result["HTTP_PROXY"] = "http://\(host):\(port)"
+        }
+        if (settings[kCFNetworkProxiesHTTPSEnable as String] as? Int) == 1,
+           let host = settings[kCFNetworkProxiesHTTPSProxy as String] as? String, !host.isEmpty,
+           let port = settings[kCFNetworkProxiesHTTPSPort as String] as? Int {
+            // Proxies accept plain-HTTP CONNECT for HTTPS traffic; the scheme
+            // here names the connection to the proxy, not the traffic it carries.
+            result["HTTPS_PROXY"] = "http://\(host):\(port)"
+        }
+        return result
     }
 
     private func uniquePath(_ components: [String]) -> [String] {

@@ -757,10 +757,20 @@ final class AppState: ObservableObject {
         guard canAttemptManagedWarmup(for: tool) else { return }
 
         await refreshQuotaForAutomaticDecision(tool: tool)
-        guard state.sourceHealth == .healthy,
-              state.canAutoWarmFromSnapshot,
-              let snapshot = state.quotaSnapshot else {
+        guard state.sourceHealth == .healthy, let snapshot = state.quotaSnapshot else {
+            // The live check itself is unavailable — the only case the
+            // activity-based fallback exists for.
             await attemptActivityFallbackWarmup(for: tool)
+            return
+        }
+        guard state.canAutoWarmFromSnapshot else {
+            // Live, healthy data, just not due for renewal — an actively-used
+            // mid-window reading, the ordinary case on every tick where a
+            // window is already open. This used to fall into the same branch
+            // as an unavailable check and re-run the fallback every single
+            // time, which — combined with the fallback missing its own
+            // "already claimed" guard until the previous fix — is why a
+            // perfectly healthy window kept re-triggering warm-up attempts.
             return
         }
         guard AutoWarmDedup.shouldWarm(
