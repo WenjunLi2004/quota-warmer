@@ -145,29 +145,74 @@ final class CredentialStore {
         return item as? Data
     }
 
-    // MARK: - Cleanup of the withdrawn long-lived-token path
+    // MARK: - Long-lived token, for the warm-up subprocess only
 
     private static let claudeLongLivedService = "com.quotawarmer.app.claude-long-lived-token"
 
-    /// Removes the Keychain item and hand-off file left behind by the withdrawn
-    /// `claude setup-token` path (see the note in `claudeCredential`). Runs once
-    /// per launch so an existing install stops carrying a credential nothing
-    /// reads any more — leaving a working token lying around unused is worse
-    /// than either using it or not having it.
-    func purgeWithdrawnLongLivedToken() {
+    /// Where the user hands the token over, once:
+    /// `claude setup-token > ~/.config/quotawarmer/claude-token`
+    private var longLivedTokenFileURL: URL {
+        fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/quotawarmer/claude-token")
+    }
+
+    /// A `claude setup-token` token, for passing to the CLI as
+    /// CLAUDE_CODE_OAUTH_TOKEN — and for nothing else.
+    ///
+    /// v1.6.0 made the mistake of preferring this over Claude Code's own
+    /// Keychain item for the *quota* lookup; `/api/oauth/usage` rejects this
+    /// token class outright with a 429 that reads exactly like rate limiting,
+    /// and the percentage stayed blank for two days. The quota path is
+    /// deliberately left alone here. This is the one place the token is the
+    /// right credential: it's what `setup-token` exists to produce, and the
+    /// CLI honours it ahead of the Keychain, so the warm-up subprocess never
+    /// reaches for an item whose approval was reset by the last rotation.
+    func longLivedClaudeTokenValue() -> String? {
+        guard let data = keychainPassword(service: Self.claudeLongLivedService),
+              let token = String(data: data, encoding: .utf8)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else { return nil }
+        return token
+    }
+
+    /// Moves a handed-over token into an item QuotaWarmer owns and deletes the
+    /// file, so it spends only moments on disk in the clear and every later
+    /// read comes from an item that never raises the approval dialog.
+    func adoptLongLivedTokenFileIfPresent() {
+        let url = longLivedTokenFileURL
+        guard fileManager.fileExists(atPath: url.path),
+              let raw = try? String(contentsOf: url, encoding: .utf8) else { return }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return }
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: Self.claudeLongLivedService
         ]
-        if SecItemDelete(query as CFDictionary) == errSecSuccess {
-            DiagnosticLogger.append("claude_long_lived_token purged=keychain")
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+        var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var insert = query
+            insert.merge(attributes) { current, _ in current }
+            status = SecItemAdd(insert as CFDictionary, nil)
         }
-        let fileURL = fileManager.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/quotawarmer/claude-token")
-        if fileManager.fileExists(atPath: fileURL.path) {
-            try? fileManager.removeItem(at: fileURL)
-            DiagnosticLogger.append("claude_long_lived_token purged=file")
+        if status == errSecSuccess {
+            try? fileManager.removeItem(at: url)
+            DiagnosticLogger.append("claude_long_lived_token adopted=yes source=file")
+        } else {
+            DiagnosticLogger.append("claude_long_lived_token adopted=no status=\(status)")
         }
+    }
+
+    func clearLongLivedClaudeToken() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.claudeLongLivedService
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 
     /// Generic-password item created and owned by QuotaWarmer. Because this

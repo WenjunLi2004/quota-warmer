@@ -56,6 +56,8 @@ struct ClaudeCLIAuthSnapshot {
 }
 
 class WarmupRunner {
+    private let credentials = CredentialStore()
+
     static let claudeLoginRequiredMessage = "Claude Code is not logged in. Run `claude auth login` in Terminal, then retry warmup."
 
     func warmup(_ tool: ToolID) async throws -> WarmupResult {
@@ -352,6 +354,22 @@ class WarmupRunner {
         // explicitly-set value, and does nothing when no system proxy is on.
         for (key, value) in Self.systemProxyEnvironment() where env[key] == nil {
             env[key] = value
+        }
+
+        // Hand the CLI a token of its own, so warming never touches Claude
+        // Code's Keychain item. That item's "Always Allow" grant is wiped every
+        // time the CLI rotates it (~8h), and the first warm-up afterwards has
+        // to *write* the refreshed token back — which raises a modal password
+        // dialog, on launchd's schedule rather than the user's, and blocks the
+        // subprocess until the 60s timeout kills it. The CLI honours this
+        // variable ahead of the Keychain (verified: an invalid value here fails
+        // with 401 instead of silently falling back), so with it set the
+        // dialog has nothing to fire on. Only the warm-up subprocess gets it —
+        // the quota lookup keeps using the Keychain mirror, because
+        // /api/oauth/usage rejects this token class.
+        if env["CLAUDE_CODE_OAUTH_TOKEN"] == nil,
+           let token = credentials.longLivedClaudeTokenValue() {
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
         }
         return env
     }
