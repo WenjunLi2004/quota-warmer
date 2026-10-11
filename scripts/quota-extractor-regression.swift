@@ -24,6 +24,13 @@ struct QuotaExtractorRegression {
             "Claude warmup should be bounded to one no-tool turn"
         )
         require(ToolID.claude.fallbackWarmupCommand != nil, "Claude warmup should have a default-model fallback")
+        // A pinned Codex model gets retired (gpt-5.4-mini was refused for
+        // ChatGPT accounts), failing every warm-up until the app is rebuilt.
+        require(
+            !ToolID.codex.warmupCommand.contains("--model")
+                && !(ToolID.codex.fallbackWarmupCommand ?? "").contains("--model"),
+            "Codex warmup must use the configured default model, not a pinned one"
+        )
 
         let cliRefreshError = QuotaProviderError.cliRefreshRequired("Claude needs its CLI refresh")
         require(
@@ -633,42 +640,42 @@ struct QuotaExtractorRegression {
         )
 
         let credentialStoreSource = readSource("Sources/QuotaWarmer/Services/CredentialStore.swift")
+        // Claude Code writes its item with /usr/bin/security, which resets the
+        // item's partition list to `apple-tool:` on every ~8h token rotation. A
+        // SecItemCopyMatching read from this ad-hoc-signed app loses its
+        // partition each time and raises the approval dialog again ("Always
+        // Allow" never stuck; LAContext.interactionNotAllowed didn't stop it).
+        // Reading through the same tool carries the partition the writer set.
+        let claudeReadBody = credentialStoreSource
+            .components(separatedBy: "private func claudeKeychainPassword(")[1]
+            .components(separatedBy: "\n    }\n")[0]
         require(
-            credentialStoreSource.contains("interactionNotAllowed = true")
-                && credentialStoreSource.contains("kSecUseAuthenticationContext")
-                && credentialStoreSource.contains("allowsUserInteraction"),
-            "Background Claude Keychain reads must not be allowed to open a password dialog"
+            claudeReadBody.contains("runSecurityTool([\"find-generic-password\"")
+                && !claudeReadBody.contains("SecItemCopyMatching")
+                && credentialStoreSource.contains("URL(fileURLWithPath: \"/usr/bin/security\")"),
+            "Claude Code's Keychain item must be read through /usr/bin/security, never SecItemCopyMatching"
         )
-        // QuotaWarmer mirrors Claude's *access* token into an item it owns, so a
-        // relaunch does not re-trigger the macOS approval dialog. The dangerous
-        // things that mirror must never do are spelled out below; a blanket ban on
-        // Keychain writes would also forbid the safe mirror, so assert the actual
-        // invariants instead.
         require(
-            credentialStoreSource.contains("Self.claudeCacheService")
-                && credentialStoreSource.contains("claudeCacheService = \"com.quotawarmer.app.claude-oauth-cache\""),
-            "The Claude credential mirror must live in a Keychain service QuotaWarmer owns"
+            claudeReadBody.contains("loginKeychainIsLocked()"),
+            "A locked login keychain must be skipped, not unlocked through a dialog"
         )
-        for writeCall in ["SecItemAdd", "SecItemUpdate", "SecItemDelete"] {
-            for line in credentialStoreSource.components(separatedBy: .newlines)
-            where line.contains(writeCall) {
-                require(
-                    !line.contains("Claude Code-credentials") && !line.contains("claudeKeychainServices"),
-                    "Keychain writes must never target Claude Code's own credential item (\(writeCall))"
-                )
-            }
+        require(
+            credentialStoreSource.contains("SecKeychainSetUserInteractionAllowed(false)"),
+            "Any remaining direct Keychain read must fail rather than open a password dialog"
+        )
+        let credentialStoreCode = credentialStoreSource.components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        for writeCall in ["SecItemAdd", "SecItemUpdate", "SecItemDelete", "add-generic-password", "delete-generic-password"] {
+            require(
+                !credentialStoreCode.contains(writeCall),
+                "QuotaWarmer must not write to the Keychain at all, least of all Claude Code's item (\(writeCall))"
+            )
         }
         require(
             !credentialStoreSource.contains("/v1/oauth/token")
                 && !credentialStoreSource.contains("grant_type=refresh_token"),
             "QuotaWarmer must not run a Claude token-refresh chain of its own"
-        )
-        require(
-            credentialStoreSource.contains("struct CachedClaudeCredential")
-                && !credentialStoreSource.components(separatedBy: "struct CachedClaudeCredential")[1]
-                    .components(separatedBy: "}")[0]
-                    .contains("refreshToken"),
-            "The mirrored Claude credential must hold only the access token, never the rotating refresh token"
         )
         // The Refresh button was a silent no-op for the whole backoff window: a
         // 4h rate-limit Retry-After pinned the menu bar to a stale reading and
@@ -773,7 +780,6 @@ struct QuotaExtractorRegression {
         )
         require(
             quotaProviderSource.contains("QuotaProviderError.cliRefreshRequired")
-                && quotaProviderSource.contains("credentialStore.invalidateCachedClaudeCredential()")
                 && !quotaProviderSource.contains("/v1/oauth/token"),
             "Expired Claude credentials must defer refresh-token rotation to Claude Code and re-read its fresh credential"
         )
