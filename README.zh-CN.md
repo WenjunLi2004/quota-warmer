@@ -42,9 +42,11 @@ Claude Code 和 Codex CLI 用的是滚动配额窗口。如果窗口只能靠你
 QuotaWarmer 安安静静地跑在菜单栏,定期检查被监控工具的配额状态。设成 Auto-warm 的工具,一旦检测到新窗口——不管是通过实时配额读数,还是(在配额接口查不到的情况下)通过"最近本地完全没有活动记录"这个信号——就会在一个隔离的临时工作目录里跑一条最小化的预热命令:
 
 ```bash
-claude --model haiku --effort low --no-session-persistence -p 'hi'
-codex exec --model gpt-5.4-mini -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral --ignore-rules 'hi'
+claude --model haiku --effort low --no-session-persistence --max-turns 1 --tools '' -p 'hi'
+codex exec -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral --ignore-rules 'hi'
 ```
+
+Codex 用的是你 Codex 配置里的默认模型,不写死某一个——写死的模型迟早会被下线(ChatGPT 账号下的 `gpt-5.4-mini` 就是这样)。装了 ChatGPT.app 的话,优先用它内置的 `codex`,而不是 npm 全局装的那个:npm 装的不会自己更新,旧客户端会被服务端拒绝使用当前的模型。
 
 本地活动读取自:
 
@@ -99,9 +101,9 @@ xcodebuild -project QuotaWarmer.xcodeproj -scheme QuotaWarmer build
 
 这里的每个 DMG 都是这个仓库自己的 `release-unsigned.yml`,在 GitHub 的 macOS runner 上、从打了 tag 的那个具体 commit 编译出来的——不是手工攒的。想核实某个 release 对应哪一份看得见的源码:把那个 tag 的 `project.yml` 和[上游 `main`](https://github.com/bcanozgur/quota-warmer/compare/main...WenjunLi2004:quota-warmer:main) 对比一下,应该只有版本号不一样;再核对下载的 DMG 的 SHA-256 和同一个 release 里发布的 `.sha256` 文件是否一致。
 
-## 两个值得知道的取舍
+## 两个踩过的坑
 
-**配额百分比偶尔会弹出钥匙串授权框。** 要拿到实时百分比,唯一办法是读 Claude Code 自己存的凭据;而 macOS 的"始终允许"授权,扛不过 Claude Code 每次轮换 OAuth 令牌(大约每 8 小时一次)对这个条目的重写——所以弹窗大概率会按这个周期反复出现。QuotaWarmer 会在两次轮换之间把令牌镜像到自己的钥匙串条目里,专门用来减少弹窗频率,但没法完全消除。如果弹窗比看到实时百分比更让你烦,把这个工具切成 **Monitor** 或 **Off** 就行——自动续期本身直接调用 CLI,完全不需要这一步。
+**为什么"始终允许"总是不管用,以及现在怎么彻底不弹窗。** Claude Code 是用苹果自带的 `/usr/bin/security` 工具写入凭据的,而每次写入(每次轮换 OAuth 令牌时一次,大约 8 小时)都会把这个条目的 *partition list* 重置成只剩这个工具自己的 `apple-tool:`。通过 Security 框架读取的 app,点了"始终允许"之后仍留在访问列表里,但下一次轮换就会丢掉自己的 partition,所以不管点多少次,弹窗都会按这个周期回来。这个 fork 的早期版本一直忍着这个问题。现在 QuotaWarmer 用和 Claude Code 一样的方式读取,也就是 `/usr/bin/security find-generic-password`;它天然带着最近一次写入设置的那个 partition,所以没有任何东西需要授权,弹窗也就不会出现。预热本来就从不需要授权:`claude` CLI 读写自己的条目走的也是同一个工具。
 
 **`claude setup-token` 生成的长期令牌在这里用不了。** 之前试过这条路,想法是"app 自己拥有的钥匙串条目不需要重新授权"——这个逻辑没错,但 Anthropic 的用量查询接口(`/api/oauth/usage`)会直接拒绝这种类型的令牌,报 429,和普通的限流长得一模一样。表面上看就像接口被打爆了,实际上只是凭据类型不对,等多久都没用。如果配额百分比连续好几个刷新周期都显示不出来、也没有限流提示自己消失,先查这个——解法是换回 Claude Code 正常的 OAuth 凭据,不是多等一会儿。
 

@@ -1,13 +1,7 @@
 import Foundation
 
 protocol QuotaProviding {
-    func fetchQuota(for tool: ToolID, allowsCredentialInteraction: Bool) async throws -> QuotaSnapshot
-}
-
-extension QuotaProviding {
-    func fetchQuota(for tool: ToolID) async throws -> QuotaSnapshot {
-        try await fetchQuota(for: tool, allowsCredentialInteraction: false)
-    }
+    func fetchQuota(for tool: ToolID) async throws -> QuotaSnapshot
 }
 
 final class QuotaProvider: QuotaProviding {
@@ -18,23 +12,20 @@ final class QuotaProvider: QuotaProviding {
         self.session = session
     }
 
-    func fetchQuota(for tool: ToolID, allowsCredentialInteraction: Bool = false) async throws -> QuotaSnapshot {
+    func fetchQuota(for tool: ToolID) async throws -> QuotaSnapshot {
         switch tool {
-        case .claude: return try await fetchClaudeQuota(allowsCredentialInteraction: allowsCredentialInteraction)
+        case .claude: return try await fetchClaudeQuota()
         case .codex: return try await fetchCodexQuota()
         }
     }
 
-    private func fetchClaudeQuota(allowsCredentialInteraction: Bool) async throws -> QuotaSnapshot {
+    private func fetchClaudeQuota() async throws -> QuotaSnapshot {
         let credential: Credential
         do {
-            credential = try await credentialStore.credential(
-                for: .claude,
-                allowsUserInteraction: allowsCredentialInteraction
-            )
+            credential = try await credentialStore.credential(for: .claude)
         } catch CredentialError.interactionRequired(_) {
             throw QuotaProviderError.credentialInteractionRequired(
-                "Claude access needs approval. Click Refresh to allow Keychain access."
+                "Claude's Keychain item couldn't be read — the login keychain may be locked. Retrying automatically."
             )
         } catch {
             throw QuotaProviderError.missingCredentials(
@@ -43,9 +34,8 @@ final class QuotaProvider: QuotaProviding {
         }
 
         if credential.isExpired {
-            // The mirrored copy aged out; the CLI's item is the only place a
-            // newer token can appear, so stop trusting the mirror.
-            credentialStore.invalidateCachedClaudeCredential()
+            // Only the CLI may refresh its rotating token; it does so on its
+            // next run, and the next read here picks the new one up.
             throw QuotaProviderError.cliRefreshRequired(
                 "Claude is signed in, but its quota credential needs a CLI refresh."
             )
@@ -60,8 +50,6 @@ final class QuotaProvider: QuotaProviding {
         } catch QuotaProviderError.authFailure {
             // Do not consume a potentially rotating refresh token here. Claude
             // Code refreshes and persists its own credential when it next runs.
-            // Drop the mirror so the retry reads Claude Code's item directly.
-            credentialStore.invalidateCachedClaudeCredential()
             throw QuotaProviderError.cliRefreshRequired(
                 "Claude is signed in, but its quota credential needs a CLI refresh."
             )

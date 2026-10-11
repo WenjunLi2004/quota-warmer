@@ -42,9 +42,11 @@ Claude Code and Codex CLI use rolling quota windows. If a window starts only whe
 QuotaWarmer runs quietly in the menu bar and periodically checks quota state for monitored providers. For a tool set to Auto-warm, when a fresh window is detected — either from a live quota reading, or, if that check is unavailable, from the absence of any recent local CLI activity — it runs a minimal warm-up command from an isolated temporary working directory:
 
 ```bash
-claude --model haiku --effort low --no-session-persistence -p 'hi'
-codex exec --model gpt-5.4-mini -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral --ignore-rules 'hi'
+claude --model haiku --effort low --no-session-persistence --max-turns 1 --tools '' -p 'hi'
+codex exec -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral --ignore-rules 'hi'
 ```
+
+Codex runs with whatever model your Codex config defaults to, rather than a pinned one — a pinned model eventually gets retired (`gpt-5.4-mini` did, for ChatGPT accounts). If ChatGPT.app is installed, its bundled `codex` is preferred over a global npm install, because an npm install doesn't update itself and older clients get refused for current models.
 
 Local activity is read from:
 
@@ -100,9 +102,9 @@ xcodebuild -project QuotaWarmer.xcodeproj -scheme QuotaWarmer build
 
 Every DMG here is built by this repo's own `release-unsigned.yml`, on GitHub's macOS runners, from the exact tagged commit — never assembled by hand. To check a given release traces back to a specific, readable commit: compare that tag's `project.yml` against [upstream `main`](https://github.com/bcanozgur/quota-warmer/compare/main...WenjunLi2004:quota-warmer:main) (the only difference should be the version string), and check the downloaded DMG's SHA-256 against the `.sha256` file published in the same release.
 
-## Two Trade-offs Worth Knowing About
+## Two Things Learned the Hard Way
 
-**The quota percentage can occasionally ask for Keychain access.** Reading Claude Code's own stored credential is the only way to get a live percentage, and macOS's "Always Allow" grant on that item does not survive Claude Code rewriting it on each OAuth token rotation (roughly every 8 hours) — so the approval dialog can reappear on that same cadence. QuotaWarmer mirrors the token into its own Keychain item between rotations specifically to cut down how often this happens, but it can't eliminate it entirely. If the prompt bothers you more than the live percentage is worth, set that tool to **Monitor** or **Off** — auto-warm itself runs the CLI directly and doesn't need this at all.
+**Why "Always Allow" never stuck, and how QuotaWarmer avoids the Keychain dialog.** Claude Code writes its credential with Apple's `/usr/bin/security` tool, and every write (one per OAuth token rotation, roughly every 8 hours) resets the item's *partition list* to that tool's own `apple-tool:` partition. An app that reads the item through the Security framework stays in the item's access list after you click "Always Allow", but loses its partition on the next rotation, so the dialog comes back on that cadence no matter how often you approve it. Earlier versions of this fork lived with that. QuotaWarmer now reads the item the same way Claude Code does, through `/usr/bin/security find-generic-password`, which always carries the partition the last write set, so there's nothing to approve and the dialog never appears. Warm-ups never needed approval at all: the `claude` CLI reads and writes its item through the same tool.
 
 **A long-lived token from `claude setup-token` will not work here.** It was tried, on the theory that an app-owned Keychain item never needs re-approval — true, but Anthropic's usage-check endpoint (`/api/oauth/usage`) rejects that token type outright, with a 429 that's indistinguishable from ordinary rate-limiting. It looks exactly like the endpoint being overloaded; it's really just the wrong kind of credential, and no amount of waiting fixes it. If the quota percentage is stuck showing nothing for more than a few refresh cycles with no rate-limit message clearing on its own, this is the first thing to check — the fix is reading Claude Code's normal OAuth credential instead, not a longer wait.
 

@@ -286,10 +286,6 @@ final class AppState: ObservableObject {
             }
         }
 
-        // Drop the credential left behind by the withdrawn setup-token path
-        // before the first fetch, so an upgrading install never reads it again.
-        CredentialStore().adoptLongLivedTokenFileIfPresent()
-
         refreshAllActivity(allowAutomaticWarmup: false)
         startQuotaRefreshTimer()
         startUIRefreshTimer()
@@ -381,17 +377,15 @@ final class AppState: ObservableObject {
 
     /// The Refresh button. Unlike a timer poll this must always do something the
     /// user can see: it ignores an outstanding rate-limit backoff (which would
-    /// otherwise leave the button a silent no-op for the whole retry window) and
-    /// may show the Keychain approval dialog, because a click is the one moment
-    /// interaction is wanted. An opted-in auto-warm still resumes here, bounded
-    /// to once per window by the usual dedup, so approving access mid-window
-    /// claims it instead of waiting for the next tick.
+    /// otherwise leave the button a silent no-op for the whole retry window). An
+    /// opted-in auto-warm still resumes here, bounded to once per window by the
+    /// usual dedup, so a recovered source mid-window claims it instead of
+    /// waiting for the next tick.
     func refreshQuotaManually(for tool: ToolID) async {
         let shouldAutoWarm = tool == .claude && state(for: tool).isAutoWarmEnabled
         await refreshQuota(
             for: tool,
             allowAutomaticWarmup: shouldAutoWarm,
-            allowsCredentialInteraction: tool == .claude,
             force: true
         )
     }
@@ -400,7 +394,6 @@ final class AppState: ObservableObject {
         for tool: ToolID,
         allowAutomaticWarmup: Bool = false,
         reconcileStuckOutcome: Bool = true,
-        allowsCredentialInteraction: Bool = false,
         allowsClaudeCLIRecovery: Bool = true,
         force: Bool = false
     ) async {
@@ -430,10 +423,7 @@ final class AppState: ObservableObject {
         state.errorMessage = nil
 
         do {
-            let snapshot = try await quotaProvider.fetchQuota(
-                for: tool,
-                allowsCredentialInteraction: allowsCredentialInteraction
-            )
+            let snapshot = try await quotaProvider.fetchQuota(for: tool)
             clearQuotaBackoff(for: state)
             clearAuthRetry(for: state)
             lastSuccessfulPollAt = Date()
@@ -1152,12 +1142,10 @@ final class AppState: ObservableObject {
                 clearAuthRetry(for: state)
                 state.sourceHealth = .authFailure
                 state.authStatus = .missing
-                addHistory(tool: state.tool, kind: .authFailure, title: "Claude access needs approval", detail: message)
-                // Only a click can grant Keychain access — no amount of polling
-                // makes this resolve itself. Retrying on the normal five-minute
-                // cadence just lines up approval dialogs, which is exactly the
-                // pattern that made this feel broken. Refresh forces through the
-                // backoff, so the user is never locked out of retrying.
+                addHistory(tool: state.tool, kind: .authFailure, title: "Claude Keychain unreadable", detail: message)
+                // A locked keychain (or anything else that would have needed a
+                // dialog) won't clear on the five-minute cadence. Refresh forces
+                // through the backoff, so the user is never locked out of retrying.
                 _ = applyQuotaBackoff(for: state, retryAfter: 30 * 60)
             case .cliRefreshRequired:
                 clearQuotaBackoff(for: state)

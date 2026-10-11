@@ -192,8 +192,8 @@ enum ToolStatusCopy {
     private static func authActionText(for state: ToolState) -> String {
         switch state.tool {
         case .claude:
-            if state.healthMessage.contains("access needs approval") {
-                return "Claude access is paused. Click Refresh to approve Keychain access."
+            if state.healthMessage.contains("Keychain item couldn't be read") {
+                return "Claude's Keychain is locked. Unlock your Mac, then Refresh."
             }
             return "Claude needs reconnecting. Run claude auth login in Terminal, then Refresh."
         case .codex:

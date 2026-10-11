@@ -38,7 +38,10 @@ enum ToolID: String, CaseIterable, Identifiable, Codable {
     var warmupCommand: String {
         switch self {
         case .claude: return "claude --model haiku --effort low --no-session-persistence --max-turns 1 --tools '' -p 'hi'"
-        case .codex:  return "codex exec --model gpt-5.4-mini -c model_reasoning_effort=\"low\" --skip-git-repo-check --ephemeral --ignore-rules 'hi'"
+        // No pinned model: a pinned one is retired out from under the app
+        // (gpt-5.4-mini now fails for ChatGPT accounts), while the configured
+        // default is whatever Codex itself currently accepts.
+        case .codex:  return "codex exec -c model_reasoning_effort=\"low\" --skip-git-repo-check --ephemeral --ignore-rules 'hi'"
         }
     }
 
@@ -47,7 +50,8 @@ enum ToolID: String, CaseIterable, Identifiable, Codable {
         case .claude:
             return "claude --effort low --no-session-persistence --max-turns 1 --tools '' -p 'hi'"
         case .codex:
-            return "codex exec -c model_reasoning_effort=\"low\" --skip-git-repo-check --ephemeral --ignore-rules 'hi'"
+            // For a default model that rejects the low-effort override.
+            return "codex exec --skip-git-repo-check --ephemeral --ignore-rules 'hi'"
         }
     }
 

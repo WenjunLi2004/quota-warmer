@@ -1,23 +1,18 @@
 import CryptoKit
 import Foundation
-import LocalAuthentication
 import Security
 
 final class CredentialStore {
     private let fileManager = FileManager.default
 
-    func credential(
-        for tool: ToolID,
-        allowsUserInteraction: Bool = false
-    ) async throws -> Credential {
+    func credential(for tool: ToolID) async throws -> Credential {
         switch tool {
-        case .claude:
-            return try claudeCredential(allowsUserInteraction: allowsUserInteraction)
+        case .claude: return try claudeCredential()
         case .codex: return try codexCredential()
         }
     }
 
-    private func claudeCredential(allowsUserInteraction: Bool) throws -> Credential {
+    private func claudeCredential() throws -> Credential {
         // NOTE: a `claude setup-token` long-lived token was briefly preferred
         // here, to dodge the recurring Keychain approval dialog. It dodged the
         // dialog and broke the app: /api/oauth/usage rejects that token class
@@ -26,31 +21,31 @@ final class CredentialStore {
         // 59 seconds before that token was adopted, and there was not one
         // afterwards. Those tokens are issued for CI, not for polling usage —
         // do not reintroduce one here without first proving a real 200 from
-        // this endpoint. The mirror below already avoids most dialogs *and*
-        // returns data that works.
+        // this endpoint.
         //
-        // Claude Code owns its Keychain item, so every read of it can raise the
-        // macOS approval dialog — the grant does not reliably survive the CLI
-        // rewriting the item on each ~8h token rotation. Mirror the still-valid
-        // access token into an item QuotaWarmer itself owns; reading our own item
-        // never prompts, so a relaunch (every login) no longer costs a dialog.
-        if let cached = cachedClaudeCredential(), !cached.isExpired {
-            DiagnosticLogger.append("claude_credential_source=mirror prompt=no")
-            return cached
-        }
-        DiagnosticLogger.append("claude_credential_source=claude-code-keychain prompt=possible")
-
+        // Claude Code's item is read through /usr/bin/security, never through
+        // SecItemCopyMatching. Claude Code itself writes the item with that
+        // tool (`security add-generic-password -U`), and every such write
+        // resets the item's partition list to `apple-tool:` alone. A
+        // SecItemCopyMatching call from QuotaWarmer (partition `cdhash:…`, since
+        // the app is ad-hoc signed) therefore needs approval again after every
+        // ~8h token rotation, no matter how often "Always Allow" was clicked —
+        // the app stays in the ACL, but its partition is gone. The dialog also
+        // ignored LAContext.interactionNotAllowed and blocked the background
+        // poll until someone answered it. `security` itself carries the
+        // `apple-tool:` partition the writer just set, so reading through it
+        // can't prompt.
         let services = claudeKeychainServices()
-        var keychainNeedsApproval = false
+        var keychainUnreadable = false
         for service in services {
-            switch claudeKeychainPassword(service: service, allowsUserInteraction: allowsUserInteraction) {
+            switch claudeKeychainPassword(service: service) {
             case .data(let data):
                 if let credential = parseClaudeCredential(data, source: "Keychain \(service)") {
-                    storeCachedClaudeCredential(credential)
+                    DiagnosticLogger.append("claude_credential_source=security-tool prompt=no")
                     return credential
                 }
-            case .interactionRequired:
-                keychainNeedsApproval = true
+            case .unreadable:
+                keychainUnreadable = true
             case .notFound:
                 break
             }
@@ -75,7 +70,7 @@ final class CredentialStore {
             return credential
         }
 
-        if keychainNeedsApproval {
+        if keychainUnreadable {
             throw CredentialError.interactionRequired("Claude")
         }
         throw CredentialError.missing("Claude")
@@ -133,6 +128,10 @@ final class CredentialStore {
     }
 
     private func keychainPassword(service: String) -> Data? {
+        // This direct read is only reached when Codex keeps no auth.json. An
+        // item another app owns would need approval here, so make this process
+        // fail such reads instead of showing a dialog.
+        SecKeychainSetUserInteractionAllowed(false)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -145,184 +144,98 @@ final class CredentialStore {
         return item as? Data
     }
 
-    // MARK: - Long-lived token, for the warm-up subprocess only
-
-    private static let claudeLongLivedService = "com.quotawarmer.app.claude-long-lived-token"
-
-    /// Where the user hands the token over, once:
-    /// `claude setup-token > ~/.config/quotawarmer/claude-token`
-    private var longLivedTokenFileURL: URL {
-        fileManager.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/quotawarmer/claude-token")
-    }
-
-    /// A `claude setup-token` token, for passing to the CLI as
-    /// CLAUDE_CODE_OAUTH_TOKEN — and for nothing else.
-    ///
-    /// v1.6.0 made the mistake of preferring this over Claude Code's own
-    /// Keychain item for the *quota* lookup; `/api/oauth/usage` rejects this
-    /// token class outright with a 429 that reads exactly like rate limiting,
-    /// and the percentage stayed blank for two days. The quota path is
-    /// deliberately left alone here. This is the one place the token is the
-    /// right credential: it's what `setup-token` exists to produce, and the
-    /// CLI honours it ahead of the Keychain, so the warm-up subprocess never
-    /// reaches for an item whose approval was reset by the last rotation.
-    func longLivedClaudeTokenValue() -> String? {
-        guard let data = keychainPassword(service: Self.claudeLongLivedService),
-              let token = String(data: data, encoding: .utf8)?
-                  .trimmingCharacters(in: .whitespacesAndNewlines),
-              !token.isEmpty else { return nil }
-        return token
-    }
-
-    /// Moves a handed-over token into an item QuotaWarmer owns and deletes the
-    /// file, so it spends only moments on disk in the clear and every later
-    /// read comes from an item that never raises the approval dialog.
-    func adoptLongLivedTokenFileIfPresent() {
-        let url = longLivedTokenFileURL
-        guard fileManager.fileExists(atPath: url.path),
-              let raw = try? String(contentsOf: url, encoding: .utf8) else { return }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return }
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.claudeLongLivedService
-        ]
-        let attributes: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
-        ]
-        var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            var insert = query
-            insert.merge(attributes) { current, _ in current }
-            status = SecItemAdd(insert as CFDictionary, nil)
-        }
-        if status == errSecSuccess {
-            try? fileManager.removeItem(at: url)
-            DiagnosticLogger.append("claude_long_lived_token adopted=yes source=file")
-        } else {
-            DiagnosticLogger.append("claude_long_lived_token adopted=no status=\(status)")
-        }
-    }
-
-    func clearLongLivedClaudeToken() {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.claudeLongLivedService
-        ]
-        SecItemDelete(query as CFDictionary)
-    }
-
-    /// Generic-password item created and owned by QuotaWarmer. Because this
-    /// process added it, SecItemCopyMatching returns it without an approval
-    /// dialog, which is the whole point of mirroring the token here.
-    private static let claudeCacheService = "com.quotawarmer.app.claude-oauth-cache"
-
-    private struct CachedClaudeCredential: Codable {
-        let accessToken: String
-        let expiresAt: Date?
-        let source: String
-    }
-
-    /// Returns the mirrored credential, or nil when absent/unreadable/malformed.
-    /// Never throws: a bad cache must always fall through to the real source.
-    private func cachedClaudeCredential() -> Credential? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.claudeCacheService,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let cached = try? JSONDecoder().decode(CachedClaudeCredential.self, from: data) else {
-            return nil
-        }
-        return Credential(
-            accessToken: cached.accessToken,
-            // Deliberately not mirrored: QuotaWarmer never refreshes Claude's
-            // rotating refresh token, so it has no reason to hold a copy.
-            refreshToken: nil,
-            accountID: nil,
-            // Marked so the diagnostics log distinguishes a prompt-free mirror
-            // read from a read that had to touch Claude Code's own item.
-            source: "\(cached.source) (cached)",
-            expiresAt: cached.expiresAt
-        )
-    }
-
-    private func storeCachedClaudeCredential(_ credential: Credential) {
-        // An access token with no known expiry can never be aged out, so it is
-        // not safe to mirror — always re-read those from the owning source.
-        guard credential.expiresAt != nil else { return }
-        let cached = CachedClaudeCredential(
-            accessToken: credential.accessToken,
-            expiresAt: credential.expiresAt,
-            source: credential.source
-        )
-        guard let data = try? JSONEncoder().encode(cached) else { return }
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.claudeCacheService
-        ]
-        let attributes: [String: Any] = [
-            kSecValueData as String: data,
-            // Cache only needs to be readable while the user is logged in, and
-            // must never sync to another machine.
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
-        ]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            var insert = query
-            insert.merge(attributes) { current, _ in current }
-            SecItemAdd(insert as CFDictionary, nil)
-        }
-    }
-
-    /// Drops the mirror so the next read goes back to Claude Code's own item.
-    /// Used when the mirrored token is rejected by the API.
-    func invalidateCachedClaudeCredential() {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.claudeCacheService
-        ]
-        SecItemDelete(query as CFDictionary)
-    }
-
     private enum ClaudeKeychainRead {
         case data(Data)
         case notFound
-        case interactionRequired
+        case unreadable
     }
 
-    /// Background quota polling must never summon a macOS password dialog.
-    /// A user-initiated Refresh is the only path allowed to request access.
-    private func claudeKeychainPassword(service: String, allowsUserInteraction: Bool) -> ClaudeKeychainRead {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        if !allowsUserInteraction {
-            let context = LAContext()
-            context.interactionNotAllowed = true
-            query[kSecUseAuthenticationContext as String] = context
+    private func claudeKeychainPassword(service: String) -> ClaudeKeychainRead {
+        // A locked login keychain would make even `security` ask for the
+        // password. Background polling must never raise a dialog, so report it
+        // as unreadable and let the caller back off instead.
+        if loginKeychainIsLocked() {
+            DiagnosticLogger.append("claude_credential_source=security-tool skipped=keychain-locked")
+            return .unreadable
         }
+        guard let result = runSecurityTool(["find-generic-password", "-s", service, "-w"]) else {
+            // Still running after the timeout, which only waiting on a dialog
+            // explains. It has been terminated; back off rather than retry.
+            DiagnosticLogger.append("claude_credential_source=security-tool timed_out=yes")
+            return .unreadable
+        }
+        // 44 is errSecItemNotFound's exit status for this subcommand.
+        guard result.status == 0 else { return .notFound }
+        guard let data = Self.decodeSecurityToolPassword(result.output) else { return .notFound }
+        return .data(data)
+    }
 
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess, let data = item as? Data {
-            return .data(data)
+    /// `security find-generic-password -w` prints the secret followed by a
+    /// newline, or as bare hex when the secret isn't printable text.
+    private static func decodeSecurityToolPassword(_ output: Data) -> Data? {
+        guard let text = String(data: output, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return nil }
+        if text.first == "{" { return Data(text.utf8) }
+        guard text.count % 2 == 0, text.allSatisfy(\.isHexDigit) else { return Data(text.utf8) }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(text.count / 2)
+        var index = text.startIndex
+        while index < text.endIndex {
+            let next = text.index(index, offsetBy: 2)
+            guard let byte = UInt8(text[index..<next], radix: 16) else { return Data(text.utf8) }
+            bytes.append(byte)
+            index = next
         }
-        if status == errSecInteractionNotAllowed || status == errSecAuthFailed || status == errSecUserCanceled {
-            return .interactionRequired
+        return Data(bytes)
+    }
+
+    /// Runs /usr/bin/security, returning its exit status and stdout — or nil
+    /// when it hadn't finished within `timeout` and was terminated.
+    private func runSecurityTool(_ arguments: [String], timeout: TimeInterval = 10) -> (status: Int32, output: Data)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let outPipe = Pipe()
+        process.standardOutput = outPipe
+
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        do {
+            try process.run()
+        } catch {
+            return nil
         }
-        return .notFound
+        // Drain concurrently so a full pipe can never stall the tool. It
+        // spawns no children, so EOF follows its exit.
+        let output = SecurityToolOutput()
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            output.data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            drained.signal()
+        }
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            return nil
+        }
+        drained.wait()
+        return (process.terminationStatus, output.data)
+    }
+
+    private final class SecurityToolOutput: @unchecked Sendable {
+        var data = Data()
+    }
+
+    /// Reads the lock state without asking to unlock (deprecated API, but
+    /// the only one that reports this for the file-based login keychain).
+    private func loginKeychainIsLocked() -> Bool {
+        var keychain: SecKeychain?
+        guard SecKeychainCopyDefault(&keychain) == errSecSuccess, let keychain else { return false }
+        var status: SecKeychainStatus = 0
+        guard SecKeychainGetStatus(keychain, &status) == errSecSuccess else { return false }
+        return status & SecKeychainStatus(kSecUnlockStateStatus) == 0
     }
 
     private func parseClaudeCredential(_ data: Data, source: String) -> Credential? {

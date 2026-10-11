@@ -56,8 +56,6 @@ struct ClaudeCLIAuthSnapshot {
 }
 
 class WarmupRunner {
-    private let credentials = CredentialStore()
-
     static let claudeLoginRequiredMessage = "Claude Code is not logged in. Run `claude auth login` in Terminal, then retry warmup."
 
     func warmup(_ tool: ToolID) async throws -> WarmupResult {
@@ -296,7 +294,17 @@ class WarmupRunner {
     private func candidateCLIURLs(named name: String) -> [URL] {
         let fileManager = FileManager.default
         let home = fileManager.homeDirectoryForCurrentUser
-        var dirs: [URL] = [
+        var dirs: [URL] = []
+        if name == "codex" {
+            // The CLI ChatGPT.app bundles first. A global npm install never
+            // updates itself, and the server stops accepting old clients for
+            // the models a ChatGPT account may use — 0.149.1 got "model is not
+            // supported when using Codex with a ChatGPT account" for every
+            // model, including the user's configured default, while the bundled
+            // 0.162 warmed fine. This copy moves with each ChatGPT.app update.
+            dirs.append(URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin"))
+        }
+        dirs += [
             URL(fileURLWithPath: "/opt/homebrew/bin"),
             URL(fileURLWithPath: "/usr/local/bin"),
             home.appendingPathComponent(".local/bin"),
@@ -356,21 +364,6 @@ class WarmupRunner {
             env[key] = value
         }
 
-        // Hand the CLI a token of its own, so warming never touches Claude
-        // Code's Keychain item. That item's "Always Allow" grant is wiped every
-        // time the CLI rotates it (~8h), and the first warm-up afterwards has
-        // to *write* the refreshed token back — which raises a modal password
-        // dialog, on launchd's schedule rather than the user's, and blocks the
-        // subprocess until the 60s timeout kills it. The CLI honours this
-        // variable ahead of the Keychain (verified: an invalid value here fails
-        // with 401 instead of silently falling back), so with it set the
-        // dialog has nothing to fire on. Only the warm-up subprocess gets it —
-        // the quota lookup keeps using the Keychain mirror, because
-        // /api/oauth/usage rejects this token class.
-        if env["CLAUDE_CODE_OAUTH_TOKEN"] == nil,
-           let token = credentials.longLivedClaudeTokenValue() {
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
-        }
         return env
     }
 
