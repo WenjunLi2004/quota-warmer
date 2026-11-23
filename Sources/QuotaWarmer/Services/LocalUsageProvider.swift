@@ -57,18 +57,25 @@ final class LocalUsageProvider {
         let today = calendar.startOfDay(for: now)
         let yesterday = calendar.date(byAdding: .day, value: -1, to: today) ?? today
         let since = calendar.date(byAdding: .day, value: -30, to: today) ?? today
-        let root = baseURL ?? tool.logDirectoryURL
 
         let buckets: [Date: UsageBucket]
-        if let root, fileManager.fileExists(atPath: root.path) {
-            switch tool {
-            case .claude:
+        switch tool {
+        case .claude:
+            if let root = baseURL ?? tool.logDirectoryURL, fileManager.fileExists(atPath: root.path) {
                 buckets = claudeBuckets(in: root, since: since)
-            case .codex:
-                buckets = codexBuckets(in: root, since: since)
+            } else {
+                buckets = [:]
             }
-        } else {
-            buckets = [:]
+        case .codex:
+            if let root = baseURL ?? tool.logDirectoryURL, fileManager.fileExists(atPath: root.path) {
+                buckets = codexBuckets(in: root, since: since)
+            } else {
+                buckets = [:]
+            }
+        case .antigravity:
+            let roots = (baseURL.map { [$0] } ?? tool.activityDirectoryURLs)
+                .filter { fileManager.fileExists(atPath: $0.path) }
+            buckets = roots.isEmpty ? [:] : antigravityBuckets(in: roots, since: since)
         }
 
         let todayBucket = buckets[today] ?? UsageBucket()
@@ -79,9 +86,16 @@ final class LocalUsageProvider {
                 aggregate.add(tokens: entry.value.tokens, cost: entry.value.costUSD)
             }
 
+        let sourceLabel: String
+        switch tool {
+        case .claude:      sourceLabel = "Claude local usage"
+        case .codex:       sourceLabel = "Codex local usage"
+        case .antigravity: sourceLabel = "Antigravity local usage"
+        }
+
         return TokenUsageSummary(
             fetchedAt: now,
-            source: tool == .claude ? "Claude local usage" : "Codex local usage",
+            source: sourceLabel,
             today: TokenUsageDay(date: today, totalTokens: todayBucket.tokens, costUSD: todayBucket.costUSD ?? 0),
             yesterday: TokenUsageDay(date: yesterday, totalTokens: yesterdayBucket.tokens, costUSD: yesterdayBucket.costUSD ?? 0),
             last30Days: TokenUsageDay(date: since, totalTokens: last30Bucket.tokens, costUSD: last30Bucket.costUSD ?? 0)
@@ -122,6 +136,123 @@ final class LocalUsageProvider {
             }
         }
         return buckets(from: records, pricing: codexCost)
+    }
+
+    private func antigravityBuckets(in roots: [URL], since: Date) -> [Date: UsageBucket] {
+        var recordsByID: [String: UsageRecord] = [:]
+        var seenFiles = Set<String>()
+        for root in roots {
+            enumerateJSONL(in: root, since: since) { url in
+                let canonical = url.resolvingSymlinksInPath().path
+                guard seenFiles.insert(canonical).inserted else { return }
+                guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+                var currentModel: String?
+                let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+                for (index, line) in lines.enumerated() {
+                    guard let object = jsonObject(String(line)) else { continue }
+                    if let initObj = object["init"] as? [String: Any],
+                       let initModel = stringValue(initObj["model"]) {
+                        currentModel = initModel
+                    }
+                    currentModel = model(from: object) ?? currentModel
+                    // Skip terminal `result` envelopes when `step_update` lines already
+                    // supplied per-step usage, or dedupe by conversation/line identity.
+                    let fallbackDate = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                    guard let recordDate = date(from: object) ?? fallbackDate,
+                          recordDate >= since,
+                          let record = antigravityRecord(from: object, date: recordDate, model: currentModel) else {
+                        continue
+                    }
+                    let id = antigravityIdentity(from: object, url: url, lineIndex: index)
+                    if let existing = recordsByID[id], existing.totalTokens >= record.totalTokens { continue }
+                    recordsByID[id] = record
+                }
+            }
+        }
+        return buckets(from: Array(recordsByID.values), pricing: antigravityCost)
+    }
+
+    private func antigravityIdentity(from object: [String: Any], url: URL, lineIndex: Int) -> String {
+        if let result = object["result"] as? [String: Any],
+           let conv = stringValue(result["conversation_id"]) {
+            return "conv:\(conv)"
+        }
+        if let conv = stringValue(object["conversation_id"]), object["usage"] != nil, object["event"] == nil {
+            return "conv:\(conv)"
+        }
+        if let sessionId = stringValue(object["sessionId"]),
+           let ts = stringValue(object["timestamp"]) {
+            return "session:\(sessionId)#\(ts)"
+        }
+        return "\(url.path)#\(lineIndex)"
+    }
+
+    private func antigravityRecord(from object: [String: Any], date: Date, model: String?) -> UsageRecord? {
+        // Skip cumulative `result` event if streaming step updates are present in the same stream;
+        // single-line `--output-format json` has no `event` key and is parsed directly.
+        if (object["event"] as? String) == "result" { return nil }
+
+        let usage: [String: Any]?
+        if let step = object["step_update"] as? [String: Any],
+           let stepUsage = step["usage"] as? [String: Any] {
+            usage = stepUsage
+        } else if let directUsage = object["usage"] as? [String: Any] {
+            usage = directUsage
+        } else if object["inputTokens"] != nil || object["outputTokens"] != nil || object["totalTokens"] != nil {
+            usage = object
+        } else {
+            usage = nil
+        }
+        guard let usage else { return nil }
+
+        let input = intValue(usage["input_tokens"] ?? usage["inputTokens"])
+        let cacheRead = intValue(usage["cache_read_tokens"] ?? usage["cacheReadTokens"] ?? usage["cachedInputTokens"])
+        let output = intValue(usage["output_tokens"] ?? usage["outputTokens"])
+        let thinking = intValue(usage["thinking_tokens"] ?? usage["thinkingTokens"] ?? usage["thinkingOutputTokens"])
+        let explicitTotal = intValue(usage["total_tokens"] ?? usage["totalTokens"])
+        let combinedOutput = output > 0 ? output : thinking
+        let resolvedTotal = explicitTotal > 0 ? explicitTotal : (input + cacheRead + combinedOutput)
+        guard resolvedTotal > 0 else { return nil }
+
+        return UsageRecord(
+            date: date,
+            model: model,
+            inputTokens: input,
+            cacheCreationFiveMinuteTokens: 0,
+            cacheCreationOneHourTokens: 0,
+            cacheReadTokens: cacheRead,
+            cachedInputTokens: cacheRead,
+            outputTokens: combinedOutput,
+            totalTokens: resolvedTotal,
+            explicitCostUSD: explicitCost(from: object)
+        )
+    }
+
+    private func antigravityCost(_ record: UsageRecord) -> Double? {
+        let text = record.model?.lowercased() ?? ""
+        if text.contains("claude") {
+            return claudeCost(record)
+        }
+        if text.contains("gpt-") {
+            return codexCost(record)
+        }
+        let rates = antigravityRates(for: record.model)
+        let uncachedInput = max(0, record.inputTokens - record.cacheReadTokens)
+        return ((Double(uncachedInput) * rates.input)
+            + (Double(record.cacheReadTokens) * rates.cacheRead)
+            + (Double(record.outputTokens) * rates.output)) / 1_000_000
+    }
+
+    private func antigravityRates(for model: String?) -> ModelRates {
+        let text = model?.lowercased() ?? ""
+        if text.contains("flash") {
+            return ModelRates(input: 0.30, cacheWrite: 0.30, cacheRead: 0.03, output: 2.50, cacheReadExplicit: true)
+        }
+        if text.contains("neon") || text.contains("argon") || text.contains("orchestrator") {
+            return ModelRates(input: 2.00, cacheWrite: 2.00, cacheRead: 0.20, output: 12.00, cacheReadExplicit: true)
+        }
+        // Default Gemini Pro / Carbon / Hydrogen tier
+        return ModelRates(input: 1.25, cacheWrite: 1.25, cacheRead: 0.125, output: 10.00, cacheReadExplicit: true)
     }
 
     private func buckets(
@@ -353,7 +484,13 @@ final class LocalUsageProvider {
     }
 
     private func parseDate(_ value: String) -> Date? {
-        iso8601Frac.date(from: value) ?? iso8601.date(from: value)
+        if let d = iso8601Frac.date(from: value) ?? iso8601.date(from: value) {
+            return d
+        }
+        if let num = Double(value), num > 0 {
+            return Date(timeIntervalSince1970: num > 10_000_000_000 ? num / 1000 : num)
+        }
+        return nil
     }
 
     private func explicitCost(from object: [String: Any]) -> Double? {

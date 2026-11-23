@@ -1,6 +1,10 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#endif
 import Foundation
+#if canImport(Security)
 import Security
+#endif
 
 final class CredentialStore {
     private let fileManager = FileManager.default
@@ -9,6 +13,7 @@ final class CredentialStore {
         switch tool {
         case .claude: return try claudeCredential()
         case .codex: return try codexCredential()
+        case .antigravity: return try antigravityCredential()
         }
     }
 
@@ -98,6 +103,40 @@ final class CredentialStore {
         throw CredentialError.missing("Codex")
     }
 
+    private func antigravityCredential() throws -> Credential {
+        if let token = ProcessInfo.processInfo.environment["ANTIGRAVITY_OAUTH_TOKEN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !token.isEmpty {
+            return Credential(
+                accessToken: token,
+                refreshToken: nil,
+                accountID: nil,
+                source: "env ANTIGRAVITY_OAUTH_TOKEN",
+                expiresAt: nil
+            )
+        }
+
+        let geminiHome = ProcessInfo.processInfo.environment["GEMINI_CLI_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let geminiRoot = (geminiHome?.isEmpty == false)
+            ? URL(fileURLWithPath: geminiHome!)
+            : fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".gemini")
+        let paths = [
+            geminiRoot.appendingPathComponent("antigravity-cli/antigravity-oauth-token"),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/antigravity-cli/antigravity-oauth-token")
+        ]
+
+        var seen = Set<String>()
+        for url in paths where seen.insert(url.path).inserted {
+            if let data = try? Data(contentsOf: url),
+               let credential = parseAntigravityCredential(data, source: displayPath(url)) {
+                return credential
+            }
+        }
+
+        throw CredentialError.missing("Antigravity")
+    }
+
     func credentialSourceSummary(for tool: ToolID) -> String {
         switch tool {
         case .claude:
@@ -112,11 +151,18 @@ final class CredentialStore {
                 "~/.codex/auth.json",
                 "Keychain Codex Auth"
             ].joined(separator: ", ")
+        case .antigravity:
+            return [
+                "Antigravity local server",
+                "agy CLI session",
+                "~/.gemini/antigravity-cli/antigravity-oauth-token"
+            ].joined(separator: ", ")
         }
     }
 
     private func claudeKeychainServices() -> [String] {
         var services = ["Claude Code-credentials"]
+        #if canImport(CryptoKit)
         if let configDir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !configDir.isEmpty {
             let hash = SHA256.hash(data: Data(configDir.utf8))
                 .map { String(format: "%02x", $0) }
@@ -124,10 +170,12 @@ final class CredentialStore {
             services.append("Claude Code-credentials-\(hash)")
             services.append("Claude Code-credentials-\(String(hash.prefix(16)))")
         }
+        #endif
         return services
     }
 
     private func keychainPassword(service: String) -> Data? {
+        #if canImport(Security)
         // This direct read is only reached when Codex keeps no auth.json. An
         // item another app owns would need approval here, so make this process
         // fail such reads instead of showing a dialog.
@@ -142,6 +190,9 @@ final class CredentialStore {
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess else { return nil }
         return item as? Data
+        #else
+        return nil
+        #endif
     }
 
     private enum ClaudeKeychainRead {
@@ -231,11 +282,15 @@ final class CredentialStore {
     /// Reads the lock state without asking to unlock (deprecated API, but
     /// the only one that reports this for the file-based login keychain).
     private func loginKeychainIsLocked() -> Bool {
+        #if canImport(Security)
         var keychain: SecKeychain?
         guard SecKeychainCopyDefault(&keychain) == errSecSuccess, let keychain else { return false }
         var status: SecKeychainStatus = 0
         guard SecKeychainGetStatus(keychain, &status) == errSecSuccess else { return false }
         return status & SecKeychainStatus(kSecUnlockStateStatus) == 0
+        #else
+        return false
+        #endif
     }
 
     private func parseClaudeCredential(_ data: Data, source: String) -> Credential? {
@@ -277,6 +332,31 @@ final class CredentialStore {
         )
     }
 
+    func parseAntigravityCredential(_ data: Data, source: String) -> Credential? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let accessToken = string(in: json, keys: [
+            "token.access_token", "token.accessToken",
+            "access_token", "accessToken", "oauth.access_token"
+        ])
+        let refreshToken = string(in: json, keys: [
+            "token.refresh_token", "token.refreshToken",
+            "refresh_token", "refreshToken", "oauth.refresh_token"
+        ])
+        let expiresAt = date(in: json, keys: [
+            "token.expiry", "token.expires_at", "token.expiresAt",
+            "expiry", "expiry_date", "expiryDate", "expires_at", "expiresAt"
+        ])
+
+        guard let token = accessToken, !token.isEmpty else { return nil }
+        return Credential(
+            accessToken: token,
+            refreshToken: refreshToken,
+            accountID: nil,
+            source: source,
+            expiresAt: expiresAt
+        )
+    }
+
     private func string(in object: [String: Any], keys: [String]) -> String? {
         for key in keys {
             if let value = value(in: object, dottedKey: key) {
@@ -307,7 +387,7 @@ final class CredentialStore {
                         ? Date(timeIntervalSince1970: seconds / 1000)
                         : Date(timeIntervalSince1970: seconds)
                 }
-                if let date = ISO8601DateFormatter().date(from: string) { return date }
+                if let date = MetricExtractor.parseISODate(string) { return date }
             }
         }
         return nil

@@ -72,7 +72,7 @@ struct MenuContent: View {
                     .foregroundStyle(appState.selectedTab == .main ? DS.C.ink : DS.C.textSub)
             }
 
-            ForEach(ToolID.allCases) { tool in
+            ForEach(appState.enabledTools) { tool in
                 SidebarToolItem(
                     tool: tool,
                     toolState: appState.state(for: tool),
@@ -105,7 +105,7 @@ struct MenuContent: View {
             MainTabView()
                 .frame(width: DS.contentWidth)
                 .frame(maxHeight: .infinity)
-        case .tool(let id):
+        case .tool(let id) where appState.state(for: id).isEnabled:
             VStack(spacing: 0) {
                 if appState.showOnboarding {
                     OnboardingView()
@@ -115,7 +115,8 @@ struct MenuContent: View {
                     toolState: appState.state(for: id),
                     onSetMode: { appState.setMode($0, for: id) },
                     onActivate: { appState.activate(id) },
-                    onRefresh: { Task { await appState.refreshQuotaManually(for: id) } }
+                    onRefresh: { Task { await appState.refreshQuotaManually(for: id) } },
+                    onDisable: { appState.setToolEnabled(false, for: id) }
                 )
                 .frame(width: DS.contentWidth)
                 .frame(maxHeight: .infinity)
@@ -123,6 +124,10 @@ struct MenuContent: View {
             }
             .frame(width: DS.contentWidth)
             .frame(maxHeight: .infinity)
+        case .tool:
+            MainTabView()
+                .frame(width: DS.contentWidth)
+                .frame(maxHeight: .infinity)
         case .settings:
             SettingsTabView()
                 .frame(width: DS.contentWidth)
@@ -281,7 +286,7 @@ struct SidebarToolItem: View {
 
     var body: some View {
         SidebarSlot(isSelected: isSelected, help: tool.shortName, action: action) {
-            Image(tool == .claude ? "ClaudeCode" : "Codex")
+            Image(tool.assetName)
                 .resizable()
                 .renderingMode(.template)
                 .scaledToFit()

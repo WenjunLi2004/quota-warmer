@@ -1,4 +1,13 @@
 import Foundation
+#if canImport(CoreFoundation)
+import CoreFoundation
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(Security)
+import Security
+#endif
 
 protocol QuotaProviding {
     func fetchQuota(for tool: ToolID) async throws -> QuotaSnapshot
@@ -6,6 +15,7 @@ protocol QuotaProviding {
 
 final class QuotaProvider: QuotaProviding {
     private let credentialStore = CredentialStore()
+    private let warmupRunner = WarmupRunner()
     private let session: URLSession
 
     init(session: URLSession = .shared) {
@@ -16,6 +26,7 @@ final class QuotaProvider: QuotaProviding {
         switch tool {
         case .claude: return try await fetchClaudeQuota()
         case .codex: return try await fetchCodexQuota()
+        case .antigravity: return try await fetchAntigravityQuota()
         }
     }
 
@@ -74,6 +85,164 @@ final class QuotaProvider: QuotaProviding {
         return try requireRecognizedMetrics(
             codexSnapshot(payload: payload, source: "Codex usage", message: credential.source)
         )
+    }
+
+    private func fetchAntigravityQuota() async throws -> QuotaSnapshot {
+        // 1. Fast path: probe the local Antigravity Desktop / IDE language server
+        //    if the user already has Antigravity open (zero subprocess startup).
+        if let localSnapshot = try? await fetchAntigravityLocalServerQuota() {
+            return localSnapshot
+        }
+
+        // 2. Headless CLI path: `agy -p /usage --output-format json` works even
+        //    when the desktop app is closed (e.g. morning pre-warm) and spends
+        //    zero model tokens on agy 1.1.11+.
+        guard let cliURL = await warmupRunner.resolveCLIURL(for: .antigravity) else {
+            throw QuotaProviderError.missingCredentials(
+                "Antigravity is not running and agy CLI was not found; launch Antigravity or install agy"
+            )
+        }
+
+        let version = await AntigravityVersionCache.shared.version(for: cliURL, runner: warmupRunner)
+        // Older agy builds (< 1.1.11) could send unrecognized slash commands as
+        // real model prompts instead of printing the internal quota report.
+        guard let version, version >= (1, 1, 11) else {
+            throw QuotaProviderError.unavailable(
+                "Antigravity CLI 1.1.11 or newer is required for /usage quota reports"
+            )
+        }
+
+        return try await fetchAntigravityCLIUsageQuota(cliURL: cliURL)
+    }
+
+    private func fetchAntigravityLocalServerQuota() async throws -> QuotaSnapshot? {
+        let psURL = URL(fileURLWithPath: "/bin/ps")
+        guard FileManager.default.isExecutableFile(atPath: psURL.path) else { return nil }
+        let psResult = await warmupRunner.runDirectCommand(
+            executableURL: psURL,
+            arguments: ["-ax", "-o", "pid=,command="],
+            timeout: 3
+        )
+        guard psResult.exitCode == 0 else { return nil }
+
+        let candidates = AntigravityLocalProbe.parseProcessList(psResult.stdout)
+        guard !candidates.isEmpty else { return nil }
+
+        let lsofPath = ["/usr/sbin/lsof", "/usr/bin/lsof"].first {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }
+
+        for candidate in candidates {
+            var ports: [Int] = []
+            if let lsofPath {
+                let lsofResult = await warmupRunner.runDirectCommand(
+                    executableURL: URL(fileURLWithPath: lsofPath),
+                    arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", String(candidate.pid)],
+                    timeout: 3
+                )
+                if lsofResult.exitCode == 0 {
+                    ports = AntigravityLocalProbe.parseListeningPorts(lsofResult.stdout)
+                }
+            }
+
+            let endpoints = AntigravityLocalProbe.candidateEndpoints(for: candidate, listeningPorts: ports)
+            guard !endpoints.isEmpty else { continue }
+
+            let sourceLabel = candidate.kind == .app ? "Antigravity app" : "Antigravity IDE"
+            for rpc in AntigravityLocalProbe.rpcTargets {
+                for endpoint in endpoints {
+                    guard let payload = try? await AntigravityLoopbackClient.shared.postJSON(
+                        endpoint: endpoint,
+                        path: rpc.path,
+                        body: rpc.body,
+                        timeout: 3.5
+                    ) else { continue }
+                    if let snapshot = try? requireRecognizedMetrics(
+                        antigravitySnapshot(
+                            payload: payload,
+                            source: "Antigravity local server",
+                            message: sourceLabel
+                        )
+                    ) {
+                        return snapshot
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    private func fetchAntigravityCLIUsageQuota(cliURL: URL) async throws -> QuotaSnapshot {
+        let stubDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("QuotaWarmerAgyProbe-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: stubDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stubDir) }
+
+        // Stub `open` / `xdg-open` so a signed-out agy invocation cannot pop open
+        // a browser login tab during unattended background polling.
+        for cmd in ["open", "xdg-open"] {
+            let stubPath = stubDir.appendingPathComponent(cmd).path
+            _ = FileManager.default.createFile(
+                atPath: stubPath,
+                contents: Data("#!/bin/sh\nexit 1\n".utf8),
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+
+        let baseEnv = warmupRunner.environment(
+            prependingPath: cliURL.deletingLastPathComponent().path,
+            cliName: "agy"
+        )
+        let stubbedPath = stubDir.path + ":" + (baseEnv["PATH"] ?? "/usr/bin:/bin")
+        let result = await warmupRunner.runDirectCommand(
+            executableURL: cliURL,
+            arguments: ["-p", "/usage", "--output-format", "json", "--print-timeout", "45s"],
+            extraEnvironment: [
+                "PATH": stubbedPath,
+                "BROWSER": stubDir.appendingPathComponent("open").path,
+                "AGY_CLI_DISABLE_AUTO_UPDATE": "true"
+            ],
+            pathPrefix: cliURL.deletingLastPathComponent().path,
+            cliName: "agy",
+            currentDirectoryURL: stubDir,
+            timeout: 50
+        )
+
+        if result.timedOut {
+            throw QuotaProviderError.unavailable("Antigravity CLI quota check timed out")
+        }
+
+        if result.exitCode == 0,
+           let data = result.stdout.data(using: .utf8),
+           let payload = try? JSONSerialization.jsonObject(with: data) {
+            if let dict = payload as? [String: Any],
+               (dict["status"] as? String) == "ERROR",
+               let errText = dict["error"] as? String,
+               WarmupRunner.isAntigravityAuthenticationFailure(errText) {
+                throw QuotaProviderError.authFailure(
+                    "Antigravity CLI is not signed in. Run agy in Terminal to sign in, then Refresh."
+                )
+            }
+            return try requireRecognizedMetrics(
+                antigravitySnapshot(
+                    payload: payload,
+                    source: "Antigravity CLI usage",
+                    message: "agy CLI"
+                )
+            )
+        }
+
+        let combined = "\(result.stdout)\n\(result.stderr)"
+        if WarmupRunner.isAntigravityAuthenticationFailure(combined) {
+            throw QuotaProviderError.authFailure(
+                "Antigravity CLI is not signed in. Run agy in Terminal to sign in, then Refresh."
+            )
+        }
+        let lower = combined.lowercased()
+        if lower.contains("429") || lower.contains("rate limit") || lower.contains("resource exhausted") {
+            throw QuotaProviderError.rateLimited("Antigravity quota source rate-limited", retryAfter: nil)
+        }
+        throw QuotaProviderError.unavailable("Antigravity CLI quota check failed")
     }
 
     private func requestJSON(url: URL, credential: Credential) async throws -> Any {
@@ -330,11 +499,465 @@ final class QuotaProvider: QuotaProviding {
     }
 
     private func codexDouble(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber { return number.doubleValue }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+            return number.doubleValue
+        }
+        if value is Bool { return nil }
         if let double = value as? Double { return double }
         if let int = value as? Int { return Double(int) }
         if let string = value as? String { return Double(string) }
         return nil
+    }
+
+    // MARK: - Antigravity quota parsing
+
+    /// Parses Antigravity quota payloads from:
+    ///  1. `agy -p /usage --output-format json` (`status == "SUCCESS"`, `command.name == "usage"`, `command.data.groups`)
+    ///  2. Local `RetrieveUserQuotaSummary` (`response.groups` / `summary.groups` / `groups`)
+    ///  3. Legacy local `GetUserStatus` / `GetCommandModelConfigs` (`clientModelConfigs`)
+    /// Falls back to the generic `MetricExtractor` only when none of those shapes is present.
+    func antigravitySnapshot(
+        payload: Any,
+        source: String,
+        message: String?,
+        now: Date = Date()
+    ) -> QuotaSnapshot {
+        guard let rawDict = payload as? [String: Any] else {
+            return emptySnapshot(tool: .antigravity, source: source, message: message, now: now)
+        }
+
+        // Unwrap CLI print report (`{"status":"SUCCESS","command":{"name":"usage","data":{...}}}`).
+        let dict: [String: Any]
+        if let status = rawDict["status"] as? String {
+            guard status == "SUCCESS",
+                  let command = rawDict["command"] as? [String: Any],
+                  (command["name"] as? String) == "usage",
+                  let data = command["data"] as? [String: Any] else {
+                return emptySnapshot(tool: .antigravity, source: source, message: message, now: now)
+            }
+            dict = data
+        } else {
+            dict = rawDict
+        }
+
+        // Reject Connect RPC error envelopes (non-zero/non-OK `code`).
+        if let code = dict["code"], !antigravityCodeIsOK(code) {
+            return emptySnapshot(tool: .antigravity, source: source, message: message, now: now)
+        }
+
+        if let groups = extractAntigravityGroups(from: dict), !groups.isEmpty {
+            return antigravityGroupsSnapshot(groups: groups, source: source, message: message, now: now)
+        }
+
+        if let configs = extractAntigravityModelConfigs(from: dict), !configs.isEmpty {
+            return antigravityModelConfigsSnapshot(configs: configs, source: source, message: message, now: now)
+        }
+
+        return snapshot(
+            tool: .antigravity,
+            source: source,
+            corroboratingSource: nil,
+            payload: dict,
+            message: message
+        )
+    }
+
+    private func emptySnapshot(tool: ToolID, source: String, message: String?, now: Date) -> QuotaSnapshot {
+        QuotaSnapshot(
+            tool: tool,
+            fetchedAt: now,
+            primarySource: source,
+            corroboratingSource: nil,
+            fiveHour: nil,
+            weekly: nil,
+            extras: [],
+            rawWindowKey: "\(source)|no-reset",
+            message: message
+        )
+    }
+
+    private func antigravityCodeIsOK(_ code: Any) -> Bool {
+        if let intCode = code as? Int { return intCode == 0 }
+        if let num = code as? NSNumber {
+            if CFGetTypeID(num) == CFBooleanGetTypeID() { return num.boolValue }
+            return num.intValue == 0
+        }
+        if let str = code as? String {
+            let lower = str.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return lower == "0" || lower == "ok" || lower == "success"
+        }
+        return false
+    }
+
+    private func extractAntigravityGroups(from dict: [String: Any]) -> [[String: Any]]? {
+        if let groups = dict["groups"] as? [[String: Any]] { return groups }
+        if let response = dict["response"] as? [String: Any],
+           let groups = response["groups"] as? [[String: Any]] {
+            return groups
+        }
+        if let summary = dict["summary"] as? [String: Any],
+           let groups = summary["groups"] as? [[String: Any]] {
+            return groups
+        }
+        return nil
+    }
+
+    private struct AntigravityParsedBucket {
+        enum Cadence {
+            case session
+            case weekly
+            case other
+        }
+        let identity: String
+        let groupLabel: String
+        let groupRank: Int
+        let bucketTitle: String
+        let cadence: Cadence
+        let remainingFraction: Double
+        let resetAt: Date?
+    }
+
+    private func antigravityGroupsSnapshot(
+        groups: [[String: Any]],
+        source: String,
+        message: String?,
+        now: Date
+    ) -> QuotaSnapshot {
+        var parsed: [AntigravityParsedBucket] = []
+        for (groupIndex, group) in groups.enumerated() {
+            let rawGroupName = ((group["displayName"] ?? group["display_name"] ?? group["name"]) as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let (groupLabel, groupRank) = normalizeAntigravityGroup(rawGroupName)
+            guard let buckets = group["buckets"] as? [[String: Any]] else { continue }
+
+            for (bucketIndex, bucket) in buckets.enumerated() {
+                if (bucket["disabled"] as? Bool) == true { continue }
+                guard let remainingRaw = extractAntigravityRemainingFraction(from: bucket),
+                      remainingRaw.isFinite else { continue }
+                let remaining = min(max(remainingRaw, 0), 1)
+
+                let bucketId = ((bucket["bucketId"] ?? bucket["bucket_id"] ?? bucket["id"]) as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "bucket-\(groupIndex)-\(bucketIndex)"
+                let bucketName = ((bucket["displayName"] ?? bucket["display_name"] ?? bucket["name"]) as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? bucketId
+                let windowStr = (bucket["window"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                let cadence = classifyAntigravityCadence(window: windowStr, id: bucketId, name: bucketName)
+                let resetAt = extractAntigravityDate(bucket["resetTime"] ?? bucket["reset_time"])
+                let shortCadenceTitle: String
+                switch cadence {
+                case .session: shortCadenceTitle = "5h"
+                case .weekly:  shortCadenceTitle = "Weekly"
+                case .other:   shortCadenceTitle = bucketName
+                }
+
+                parsed.append(AntigravityParsedBucket(
+                    identity: "\(groupIndex):\(bucketId)",
+                    groupLabel: groupLabel,
+                    groupRank: groupRank,
+                    bucketTitle: "\(groupLabel) \(shortCadenceTitle)",
+                    cadence: cadence,
+                    remainingFraction: remaining,
+                    resetAt: resetAt
+                ))
+            }
+        }
+
+        guard !parsed.isEmpty else {
+            return emptySnapshot(tool: .antigravity, source: source, message: message, now: now)
+        }
+
+        let selectedSession = selectMostConstrainedAntigravityBucket(
+            parsed.filter { $0.cadence == .session }
+        )
+        let selectedWeekly = selectMostConstrainedAntigravityBucket(
+            parsed.filter { $0.cadence == .weekly }
+        )
+
+        let windowDuration = ToolID.antigravity.windowDuration
+        let fiveHour: QuotaMetric? = selectedSession.map { bucket in
+            buildAntigravitySessionMetric(
+                remainingFraction: bucket.remainingFraction,
+                resetAt: bucket.resetAt,
+                detail: bucket.groupLabel,
+                windowDuration: windowDuration,
+                now: now
+            )
+        }
+
+        let weekly: QuotaMetric? = selectedWeekly.map { bucket in
+            QuotaMetric(
+                name: "Weekly",
+                usedPercent: 1 - bucket.remainingFraction,
+                remainingPercent: bucket.remainingFraction,
+                resetAt: bucket.resetAt,
+                detail: bucket.groupLabel,
+                context: "\(bucket.groupLabel.lowercased()) weekly",
+                isIdle: false
+            )
+        }
+
+        let extras: [QuotaMetric] = parsed
+            .filter { $0.identity != selectedSession?.identity && $0.identity != selectedWeekly?.identity }
+            .map { bucket in
+                QuotaMetric(
+                    name: bucket.bucketTitle,
+                    usedPercent: 1 - bucket.remainingFraction,
+                    remainingPercent: bucket.remainingFraction,
+                    resetAt: bucket.resetAt,
+                    detail: bucket.groupLabel,
+                    context: bucket.bucketTitle.lowercased(),
+                    isIdle: false
+                )
+            }
+
+        let fiveHourKey = (fiveHour?.isIdle == true)
+            ? "idle"
+            : (fiveHour?.resetAt.map { ISO8601DateFormatter().string(from: $0) } ?? "no-reset")
+
+        return QuotaSnapshot(
+            tool: .antigravity,
+            fetchedAt: now,
+            primarySource: source,
+            corroboratingSource: nil,
+            fiveHour: fiveHour,
+            weekly: weekly,
+            extras: extras,
+            rawWindowKey: [source, fiveHourKey].joined(separator: "|"),
+            message: message
+        )
+    }
+
+    private func buildAntigravitySessionMetric(
+        remainingFraction: Double,
+        resetAt: Date?,
+        detail: String?,
+        windowDuration: TimeInterval,
+        now: Date
+    ) -> QuotaMetric {
+        let isResetlessFull = resetAt == nil && remainingFraction >= 0.999
+        let isSlidingFull = remainingFraction >= 0.999
+            && (resetAt.map { $0.timeIntervalSince(now) >= windowDuration - 15 } ?? false)
+        let isIdle = isResetlessFull || isSlidingFull
+        let effectiveReset = resetAt ?? (isIdle ? now.addingTimeInterval(windowDuration) : nil)
+
+        return QuotaMetric(
+            name: "5h",
+            usedPercent: 1 - remainingFraction,
+            remainingPercent: remainingFraction,
+            resetAt: effectiveReset,
+            detail: detail,
+            context: isIdle ? "5h idle window" : "\((detail ?? "antigravity").lowercased()) 5h",
+            isIdle: isIdle
+        )
+    }
+
+    private func selectMostConstrainedAntigravityBucket(
+        _ candidates: [AntigravityParsedBucket]
+    ) -> AntigravityParsedBucket? {
+        candidates.min { lhs, rhs in
+            if abs(lhs.remainingFraction - rhs.remainingFraction) > 0.0001 {
+                return lhs.remainingFraction < rhs.remainingFraction
+            }
+            if lhs.groupRank != rhs.groupRank {
+                return lhs.groupRank < rhs.groupRank
+            }
+            if (lhs.resetAt != nil) != (rhs.resetAt != nil) {
+                return lhs.resetAt != nil
+            }
+            return lhs.identity < rhs.identity
+        }
+    }
+
+    private func normalizeAntigravityGroup(_ rawName: String) -> (label: String, rank: Int) {
+        let lower = rawName.lowercased()
+        // Plain "Gemini Models" is the primary pool; versioned pools like
+        // "Gemini 4 Argon" have independent limits and keep their own title.
+        if lower.contains("gemini"), !rawName.contains(where: \.isNumber) {
+            return ("Gemini", 0)
+        }
+        if lower.contains("claude") || lower.contains("gpt") {
+            return ("Claude/GPT", 1)
+        }
+        return (rawName.isEmpty ? "Quota" : rawName, 2)
+    }
+
+    private func classifyAntigravityCadence(
+        window: String?,
+        id: String,
+        name: String
+    ) -> AntigravityParsedBucket.Cadence {
+        let probes = (window?.isEmpty == false ? [window!] : [id, name]).map {
+            $0.lowercased().replacingOccurrences(of: "_", with: "-")
+        }
+        for p in probes {
+            if p.contains("5h") || p.contains("5-hour") || p.contains("five hour") || p.contains("five-hour") || p == "session" {
+                return .session
+            }
+        }
+        for p in probes {
+            if p.contains("weekly") || p.contains("7-day") || p.contains("7d") || p.contains("seven-day") || p.contains("week") {
+                return .weekly
+            }
+        }
+        return .other
+    }
+
+    private func extractAntigravityRemainingFraction(from dict: [String: Any]) -> Double? {
+        if let direct = codexDouble(dict["remainingFraction"] ?? dict["remaining_fraction"]) {
+            return direct
+        }
+        if let nested = dict["remaining"] as? [String: Any] {
+            if let directNested = codexDouble(nested["remainingFraction"] ?? nested["remaining_fraction"]) {
+                return directNested
+            }
+            if let oneofCase = nested["case"] as? String,
+               (oneofCase == "remainingFraction" || oneofCase == "remaining_fraction"),
+               let val = codexDouble(nested["value"]) {
+                return val
+            }
+        }
+        return nil
+    }
+
+    private func extractAntigravityDate(_ value: Any?) -> Date? {
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let iso = MetricExtractor.parseISODate(trimmed) {
+                return iso
+            }
+            if let epoch = Double(trimmed), epoch > 0 {
+                return Date(timeIntervalSince1970: epoch > 10_000_000_000 ? epoch / 1000 : epoch)
+            }
+        }
+        if let epoch = codexDouble(value), epoch > 0 {
+            return Date(timeIntervalSince1970: epoch > 10_000_000_000 ? epoch / 1000 : epoch)
+        }
+        return nil
+    }
+
+    private func extractAntigravityModelConfigs(from dict: [String: Any]) -> [[String: Any]]? {
+        if let configs = dict["clientModelConfigs"] as? [[String: Any]] {
+            return configs
+        }
+        if let configs = dict["client_model_configs"] as? [[String: Any]] {
+            return configs
+        }
+        if let userStatus = (dict["userStatus"] ?? dict["user_status"]) as? [String: Any],
+           let cascade = (userStatus["cascadeModelConfigData"] ?? userStatus["cascade_model_config_data"]) as? [String: Any],
+           let configs = (cascade["clientModelConfigs"] ?? cascade["client_model_configs"]) as? [[String: Any]] {
+            return configs
+        }
+        return nil
+    }
+
+    private func antigravityModelConfigsSnapshot(
+        configs: [[String: Any]],
+        source: String,
+        message: String?,
+        now: Date
+    ) -> QuotaSnapshot {
+        struct ModelCandidate {
+            let label: String
+            let modelId: String
+            let isGemini: Bool
+            let remainingFraction: Double
+            let resetAt: Date?
+        }
+
+        var candidates: [ModelCandidate] = []
+        for config in configs {
+            let label = (config["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let alias = (config["modelOrAlias"] ?? config["model_or_alias"]) as? [String: Any]
+            let modelId = (alias?["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? label
+            let combined = "\(label) \(modelId)".lowercased()
+            // Auxiliary models (lite, autocomplete, image) carry separate internal pools
+            // and must not mask the user's primary coding model quota.
+            if combined.contains("lite") || combined.contains("autocomplete")
+                || modelId.lowercased().hasPrefix("tab_") || combined.contains("image") {
+                continue
+            }
+            guard let quotaInfo = (config["quotaInfo"] ?? config["quota_info"]) as? [String: Any],
+                  let remRaw = codexDouble(quotaInfo["remainingFraction"] ?? quotaInfo["remaining_fraction"]),
+                  remRaw.isFinite else { continue }
+            let remaining = min(max(remRaw, 0), 1)
+            let resetAt = extractAntigravityDate(quotaInfo["resetTime"] ?? quotaInfo["reset_time"])
+            candidates.append(ModelCandidate(
+                label: label.isEmpty ? modelId : label,
+                modelId: modelId,
+                isGemini: combined.contains("gemini"),
+                remainingFraction: remaining,
+                resetAt: resetAt
+            ))
+        }
+
+        guard !candidates.isEmpty else {
+            return emptySnapshot(tool: .antigravity, source: source, message: message, now: now)
+        }
+
+        let weeklyCandidates = candidates.filter { c in
+            if c.label.lowercased().contains("week") { return true }
+            if let resetAt = c.resetAt, resetAt.timeIntervalSince(now) > 24 * 3600 { return true }
+            return false
+        }
+        let sessionCandidates = candidates.filter { c in
+            !weeklyCandidates.contains(where: { $0.modelId == c.modelId && $0.label == c.label })
+        }
+
+        let pickBest: ([ModelCandidate]) -> ModelCandidate? = { list in
+            list.min { lhs, rhs in
+                if abs(lhs.remainingFraction - rhs.remainingFraction) > 0.0001 {
+                    return lhs.remainingFraction < rhs.remainingFraction
+                }
+                if lhs.isGemini != rhs.isGemini {
+                    return lhs.isGemini
+                }
+                return lhs.label < rhs.label
+            }
+        }
+
+        let windowDuration = ToolID.antigravity.windowDuration
+        let chosenSession = pickBest(sessionCandidates)
+        let chosenWeekly = pickBest(weeklyCandidates)
+
+        let fiveHour = chosenSession.map { c in
+            buildAntigravitySessionMetric(
+                remainingFraction: c.remainingFraction,
+                resetAt: c.resetAt,
+                detail: c.label,
+                windowDuration: windowDuration,
+                now: now
+            )
+        }
+        let weekly = chosenWeekly.map { c in
+            QuotaMetric(
+                name: "Weekly",
+                usedPercent: 1 - c.remainingFraction,
+                remainingPercent: c.remainingFraction,
+                resetAt: c.resetAt,
+                detail: c.label,
+                context: "\(c.label.lowercased()) weekly",
+                isIdle: false
+            )
+        }
+
+        let fiveHourKey = (fiveHour?.isIdle == true)
+            ? "idle"
+            : (fiveHour?.resetAt.map { ISO8601DateFormatter().string(from: $0) } ?? "no-reset")
+
+        return QuotaSnapshot(
+            tool: .antigravity,
+            fetchedAt: now,
+            primarySource: source,
+            corroboratingSource: nil,
+            fiveHour: fiveHour,
+            weekly: weekly,
+            extras: [],
+            rawWindowKey: [source, fiveHourKey].joined(separator: "|"),
+            message: message
+        )
     }
 
     private func selectWeeklyMetric(from metrics: [QuotaMetric], now: Date) -> QuotaMetric? {
@@ -657,3 +1280,304 @@ private enum HTTPDateFormatter {
         return formatter
     }()
 }
+
+// MARK: - Antigravity Local Server & Version Helpers
+
+enum AntigravityLocalProbe {
+    enum ProcessKind: Equatable {
+        case app
+        case ide
+    }
+
+    struct ProcessCandidate: Equatable {
+        let pid: Int
+        let kind: ProcessKind
+        let csrfToken: String
+        let extensionPort: Int?
+        let extensionServerCSRFToken: String?
+    }
+
+    struct Endpoint: Equatable {
+        let scheme: String
+        let port: Int
+        let csrfToken: String
+    }
+
+    struct RPCTarget {
+        let path: String
+        let body: [String: Any]
+    }
+
+    static let rpcTargets: [RPCTarget] = [
+        RPCTarget(
+            path: "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+            body: ["forceRefresh": true]
+        ),
+        RPCTarget(
+            path: "/exa.language_server_pb.LanguageServerService/GetUserStatus",
+            body: [
+                "metadata": [
+                    "ideName": "antigravity",
+                    "extensionName": "antigravity",
+                    "ideVersion": "unknown",
+                    "locale": "en"
+                ]
+            ]
+        ),
+        RPCTarget(
+            path: "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs",
+            body: [
+                "metadata": [
+                    "ideName": "antigravity",
+                    "extensionName": "antigravity",
+                    "ideVersion": "unknown",
+                    "locale": "en"
+                ]
+            ]
+        )
+    ]
+
+    /// Parses `ps -ax -o pid=,command=` output and extracts running Antigravity
+    /// Desktop / IDE language-server processes with their local CSRF tokens.
+    /// App servers sort ahead of IDE extension servers because the app exposes
+    /// the structured quota summary first.
+    static func parseProcessList(_ output: String) -> [ProcessCandidate] {
+        var candidates: [ProcessCandidate] = []
+        for rawLine in output.split(separator: "\n") {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let parts = trimmed.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            guard parts.count == 2, let pid = Int(parts[0]) else { continue }
+            let command = String(parts[1])
+            guard let kind = classifyCommandLine(command),
+                  let csrf = extractFlag("--csrf_token", from: command),
+                  !csrf.isEmpty else {
+                continue
+            }
+            let extPort = extractFlag("--extension_server_port", from: command).flatMap { Int($0) }
+            let extCsrf = extractFlag("--extension_server_csrf_token", from: command)
+            candidates.append(ProcessCandidate(
+                pid: pid,
+                kind: kind,
+                csrfToken: csrf,
+                extensionPort: extPort,
+                extensionServerCSRFToken: extCsrf
+            ))
+        }
+        return candidates.sorted { lhs, rhs in
+            if lhs.kind != rhs.kind { return lhs.kind == .app }
+            return lhs.pid < rhs.pid
+        }
+    }
+
+    private static func classifyCommandLine(_ command: String) -> ProcessKind? {
+        let lower = command.lowercased()
+        let isLanguageServer = lower.contains("language_server") || lower.contains("language-server")
+        guard isLanguageServer else { return nil }
+        guard lower.contains("antigravity") else { return nil }
+
+        if lower.contains("--app_data_dir antigravity-ide")
+            || lower.contains("--app_data_dir=antigravity-ide")
+            || lower.contains("antigravity ide.app")
+            || lower.contains("/extensions/antigravity/") {
+            return .ide
+        }
+        return .app
+    }
+
+    private static func extractFlag(_ flag: String, from command: String) -> String? {
+        let tokens = command.split(whereSeparator: \.isWhitespace).map(String.init)
+        for (idx, token) in tokens.enumerated() {
+            if token == flag, idx + 1 < tokens.count {
+                let value = tokens[idx + 1]
+                return value.hasPrefix("--") ? nil : value
+            }
+            let prefix = "\(flag)="
+            if token.hasPrefix(prefix) {
+                let value = String(token.dropFirst(prefix.count))
+                return value.isEmpty ? nil : value
+            }
+        }
+        return nil
+    }
+
+    static func parseListeningPorts(_ lsofOutput: String) -> [Int] {
+        guard let regex = try? NSRegularExpression(pattern: #":(\d+)\s+\(LISTEN\)"#) else {
+            return []
+        }
+        let range = NSRange(lsofOutput.startIndex..<lsofOutput.endIndex, in: lsofOutput)
+        var ports = Set<Int>()
+        regex.enumerateMatches(in: lsofOutput, options: [], range: range) { match, _, _ in
+            guard let match,
+                  let portRange = Range(match.range(at: 1), in: lsofOutput),
+                  let port = Int(lsofOutput[portRange]),
+                  (1...65_535).contains(port) else { return }
+            ports.insert(port)
+        }
+        return ports.sorted()
+    }
+
+    static func candidateEndpoints(for candidate: ProcessCandidate, listeningPorts: [Int]) -> [Endpoint] {
+        var endpoints: [Endpoint] = []
+        #if os(Linux)
+        let schemes = ["https", "http"]
+        #else
+        let schemes = ["https"]
+        #endif
+
+        for port in listeningPorts {
+            for scheme in schemes {
+                endpoints.append(Endpoint(scheme: scheme, port: port, csrfToken: candidate.csrfToken))
+            }
+        }
+
+        if let extPort = candidate.extensionPort {
+            if let extToken = candidate.extensionServerCSRFToken, !extToken.isEmpty {
+                let ep = Endpoint(scheme: "http", port: extPort, csrfToken: extToken)
+                if !endpoints.contains(ep) { endpoints.append(ep) }
+            }
+            let fallbackEp = Endpoint(scheme: "http", port: extPort, csrfToken: candidate.csrfToken)
+            if !endpoints.contains(fallbackEp) { endpoints.append(fallbackEp) }
+        }
+
+        return endpoints
+    }
+}
+
+actor AntigravityVersionCache {
+    static let shared = AntigravityVersionCache()
+
+    private struct BinaryIdentity: Equatable {
+        let path: String
+        let mtime: Date
+        let size: UInt64
+    }
+
+    private var cached: (identity: BinaryIdentity, version: (Int, Int, Int))?
+
+    func version(for cliURL: URL, runner: WarmupRunner) async -> (Int, Int, Int)? {
+        let resolvedPath = cliURL.resolvingSymlinksInPath().path
+        let identity: BinaryIdentity? = {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: resolvedPath),
+                  let mtime = attrs[.modificationDate] as? Date,
+                  let size = (attrs[.size] as? NSNumber)?.uint64Value else {
+                return nil
+            }
+            return BinaryIdentity(path: resolvedPath, mtime: mtime, size: size)
+        }()
+
+        if let identity, let cached, cached.identity == identity {
+            return cached.version
+        }
+
+        let result = await runner.runDirectCommand(
+            executableURL: cliURL,
+            arguments: ["--version"],
+            pathPrefix: cliURL.deletingLastPathComponent().path,
+            cliName: "agy",
+            timeout: 4
+        )
+        guard result.exitCode == 0,
+              let parsed = Self.parseVersion(result.stdout) else {
+            return nil
+        }
+        if let identity {
+            cached = (identity, parsed)
+        }
+        return parsed
+    }
+
+    static func parseVersion(_ output: String) -> (Int, Int, Int)? {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let regex = try? NSRegularExpression(pattern: #"\b(\d+)\.(\d+)\.(\d+)\b"#),
+              let match = regex.firstMatch(in: trimmed, options: [], range: NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)),
+              let r1 = Range(match.range(at: 1), in: trimmed),
+              let r2 = Range(match.range(at: 2), in: trimmed),
+              let r3 = Range(match.range(at: 3), in: trimmed),
+              let major = Int(trimmed[r1]),
+              let minor = Int(trimmed[r2]),
+              let patch = Int(trimmed[r3]) else {
+            return nil
+        }
+        return (major, minor, patch)
+    }
+}
+
+/// Loopback-only HTTP/HTTPS client for Antigravity's local language server,
+/// which uses a self-signed certificate on `127.0.0.1`. Server-trust override
+/// is strictly confined to loopback hosts.
+private final class AntigravityLoopbackClient: NSObject, URLSessionDelegate, @unchecked Sendable {
+    static let shared = AntigravityLoopbackClient()
+
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 4
+        config.timeoutIntervalForResource = 8
+        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }()
+
+    func postJSON(
+        endpoint: AntigravityLocalProbe.Endpoint,
+        path: String,
+        body: [String: Any],
+        timeout: TimeInterval
+    ) async throws -> Any {
+        guard endpoint.port > 0,
+              let url = URL(string: "\(endpoint.scheme)://127.0.0.1:\(endpoint.port)\(path)") else {
+            throw QuotaProviderError.unavailable("Invalid local Antigravity endpoint")
+        }
+
+        let dataBody = try JSONSerialization.data(withJSONObject: body)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = dataBody
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        if !endpoint.csrfToken.isEmpty {
+            request.setValue(endpoint.csrfToken, forHTTPHeaderField: "X-Codeium-Csrf-Token")
+        }
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw QuotaProviderError.unavailable("Local Antigravity server returned non-200")
+        }
+        return try JSONSerialization.jsonObject(with: data)
+    }
+
+    #if canImport(Security)
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        let host = challenge.protectionSpace.host
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           (host == "127.0.0.1" || host == "localhost"),
+           let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
+    }
+    #endif
+}
+
+#if os(Linux)
+extension URLSession {
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { continuation in
+            let task = dataTask(with: request) { data, response, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let data, let response {
+                    continuation.resume(returning: (data, response))
+                } else {
+                    continuation.resume(throwing: URLError(.badServerResponse))
+                }
+            }
+            task.resume()
+        }
+    }
+}
+#endif

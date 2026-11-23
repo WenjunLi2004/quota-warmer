@@ -23,6 +23,15 @@ struct SettingsTabView: View {
             VStack(alignment: .leading, spacing: 0) {
                 settingsHeader
 
+                group("PROVIDERS") {
+                    ForEach(Array(ToolID.allCases.enumerated()), id: \.element.id) { index, tool in
+                        if index > 0 {
+                            Divider().background(DS.C.border).padding(.leading, 36)
+                        }
+                        providerToggleRow(tool)
+                    }
+                }
+
                 group("CHECKS") {
                     row(icon: "clock.arrow.2.circlepath", title: "Quota Refresh Interval",
                         subtitle: "Default 5 minutes") {
@@ -37,7 +46,7 @@ struct SettingsTabView: View {
                     row(icon: "shield.lefthalf.filled", title: "Rate-limit Guard",
                         subtitle: "Back off after failures") {
                         Toggle("", isOn: $rateLimitGuard)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                     }
 
                     Divider().background(DS.C.border).padding(.leading, 36)
@@ -64,7 +73,7 @@ struct SettingsTabView: View {
                             get: { appState.morningPrewarmEnabled },
                             set: { appState.setMorningPrewarm($0) }
                         ))
-                        .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                        .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                     }
 
                     Divider().background(DS.C.border).padding(.leading, 36)
@@ -83,7 +92,7 @@ struct SettingsTabView: View {
                     row(icon: "calendar", title: "Weekdays Only",
                         subtitle: "Skip Saturday and Sunday") {
                         Toggle("", isOn: $morningWeekdaysOnly)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                             .onChange(of: morningWeekdaysOnly) { _, _ in appState.morningTimeChanged() }
                     }
 
@@ -106,7 +115,7 @@ struct SettingsTabView: View {
                     row(icon: "bell.badge", title: "Window Expiring Soon",
                         subtitle: "30 min before reset") {
                         Toggle("", isOn: $notifyWarning)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                     }
 
                     Divider().background(DS.C.border).padding(.leading, 36)
@@ -114,7 +123,7 @@ struct SettingsTabView: View {
                     row(icon: "checkmark.circle", title: "Window Activated",
                         subtitle: "After warmup succeeds") {
                         Toggle("", isOn: $notifyActivated)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                     }
                 }
 
@@ -122,7 +131,7 @@ struct SettingsTabView: View {
                     row(icon: "power", title: "Launch at Login",
                         subtitle: "Start with macOS") {
                         Toggle("", isOn: $launchAtLogin)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                             .onChange(of: launchAtLogin) { _, v in
                                 try? v ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
                             }
@@ -132,12 +141,12 @@ struct SettingsTabView: View {
                 group("HOW IT WORKS") {
                     transparencyRow(
                         "What QuotaWarmer does",
-                        "It watches your own Claude Code and Codex quota windows. Only for tools you switch to Auto-warm, it sends a single minimal \"hi\" through the CLI you're already logged into, the moment a fresh window opens."
+                        "It watches your enabled Claude Code, Codex, and Antigravity quota windows. Only for tools you switch to Auto-warm, it sends a single minimal \"hi\" through the CLI you're already signed into, the moment a fresh window opens."
                     )
                     Divider().background(DS.C.border).padding(.leading, 36)
                     transparencyRow(
                         "What it never does",
-                        "It never bypasses or raises your limits, never shares or uploads your credentials, and never sends anything for tools left on Monitor or Off."
+                        "It never bypasses or raises your limits, never shares or uploads your credentials, and never polls or sends anything for providers you turn off."
                     )
                     Divider().background(DS.C.border).padding(.leading, 36)
                     transparencyRow(
@@ -149,7 +158,7 @@ struct SettingsTabView: View {
                 group("PRIVACY") {
                     infoRow(
                         title: "Credential access",
-                        detail: "Monitored tools only. Claude reads Keychain Claude Code-credentials, env CLAUDE_CODE_OAUTH_TOKEN, or ~/.claude/.credentials.json. Codex reads auth.json or Keychain Codex Auth."
+                        detail: "Enabled & monitored tools only. Claude reads Keychain Claude Code-credentials, env CLAUDE_CODE_OAUTH_TOKEN, or ~/.claude/.credentials.json. Codex reads auth.json or Keychain Codex Auth. Antigravity reads your local Antigravity server or agy /usage."
                     )
                     Divider().background(DS.C.border).padding(.leading, 36)
                     infoRow(
@@ -298,6 +307,42 @@ struct SettingsTabView: View {
             }
             Spacer()
             control()
+        }
+        .padding(.horizontal, DS.Space.md)
+        .padding(.vertical, DS.Space.sm + 2)
+    }
+
+    private func providerToggleRow(_ tool: ToolID) -> some View {
+        let state = appState.state(for: tool)
+        let subtitle = state.isEnabled
+            ? "Enabled · \(state.mode.label)"
+            : "Turned off — hidden & not checked"
+
+        return HStack(spacing: DS.Space.sm) {
+            Image(tool.assetName)
+                .resizable()
+                .renderingMode(.template)
+                .scaledToFit()
+                .frame(width: 15, height: 15)
+                .foregroundStyle(state.isEnabled ? DS.C.text : DS.C.textMuted)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(tool.displayName)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(state.isEnabled ? DS.C.text : DS.C.textSub)
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(DS.C.textMuted)
+            }
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { state.isEnabled },
+                set: { appState.setToolEnabled($0, for: tool) }
+            ))
+            .toggleStyle(.switch)
+            .scaleEffect(0.75)
+            .tint(DS.C.accent(tool))
+            .accessibilityLabel(Text("Enable \(tool.displayName)"))
         }
         .padding(.horizontal, DS.Space.md)
         .padding(.vertical, DS.Space.sm + 2)

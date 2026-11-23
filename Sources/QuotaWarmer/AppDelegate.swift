@@ -119,6 +119,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeItem("Show Stats", #selector(showStats)))
         menu.addItem(makeItem("Go to Settings", #selector(goToSettings)))
 
+        let providers = NSMenuItem(title: "Providers", action: nil, keyEquivalent: "")
+        let providersSubmenu = NSMenu()
+        for tool in ToolID.allCases {
+            let entry = makeItem(tool.displayName, #selector(toggleProviderEnabled(_:)))
+            entry.state = appState.state(for: tool).isEnabled ? .on : .off
+            entry.representedObject = tool.rawValue
+            providersSubmenu.addItem(entry)
+        }
+        providers.submenu = providersSubmenu
+        menu.addItem(providers)
+
         let debug = NSMenuItem(title: "Debug Level", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
         for level in DebugLevel.allCases {
@@ -151,6 +162,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func goToSettings() {
         appState.selectedTab = .settings
         showPanel()
+    }
+
+    @objc private func toggleProviderEnabled(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let tool = ToolID(rawValue: raw) else { return }
+        let current = appState.state(for: tool).isEnabled
+        appState.setToolEnabled(!current, for: tool)
     }
 
     @objc private func setDebugLevel(_ sender: NSMenuItem) {

@@ -5,20 +5,23 @@ struct ToolTabView: View {
     let onSetMode: (ToolMode) -> Void
     let onActivate: () -> Void
     let onRefresh: () -> Void
+    var onDisable: (() -> Void)? = nil
 
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     @State private var now = Date()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-            quotaList
-            actions
-            Spacer(minLength: 0)
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 16) {
+                header
+                quotaList
+                actions
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 18)
+            .padding(.bottom, 16)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 18)
-        .padding(.bottom, 16)
         .background(DS.C.bg)
         .onReceive(ticker) { t in now = t }
     }
@@ -26,7 +29,7 @@ struct ToolTabView: View {
     private var header: some View {
         HStack(alignment: .center) {
             HStack(spacing: 9) {
-                Image(toolState.tool == .claude ? "ClaudeCode" : "Codex")
+                Image(toolState.tool.assetName)
                     .resizable()
                     .renderingMode(.template)
                     .scaledToFit()
@@ -62,6 +65,9 @@ struct ToolTabView: View {
                 resetAt: toolState.weeklyMetric?.resetAt,
                 windowDuration: toolState.tool.weeklyWindowDuration
             )
+            if let extras = toolState.quotaSnapshot?.extras, !extras.isEmpty {
+                extraPoolsSection(extras)
+            }
             tokenUsageSection
             if let issue = ToolStatusCopy.providerIssue(for: toolState) {
                 Text(issue)
@@ -74,12 +80,31 @@ struct ToolTabView: View {
         .padding(.top, 4)
     }
 
+    private func extraPoolsSection(_ extras: [QuotaMetric]) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Divider().overlay(DS.C.borderSoft)
+            Text("Other Pools")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(DS.C.textMuted)
+            ForEach(extras) { extra in
+                let isWeekly = extra.name.lowercased().contains("week")
+                windowRow(
+                    title: extra.name,
+                    metric: extra,
+                    resetAt: extra.resetAt,
+                    windowDuration: isWeekly ? toolState.tool.weeklyWindowDuration : toolState.tool.windowDuration
+                )
+            }
+        }
+    }
+
     private func windowRow(title: String, metric: QuotaMetric?, resetAt: Date?, windowDuration: TimeInterval) -> some View {
         let quotaLeft = metric?.remainingFraction ?? 0
+        let effectiveReset = metric?.isIdleFiveHourWindow == true ? nil : resetAt
         let leftText = ToolStatusCopy.quotaLeftText(for: toolState, metric: metric)
         let pace = QuotaPace.compute(
             quotaLeft: quotaLeft,
-            resetAt: resetAt,
+            resetAt: effectiveReset,
             windowDuration: windowDuration,
             now: now,
             fallbackResetText: fallbackResetText(metric: metric)
@@ -211,6 +236,22 @@ struct ToolTabView: View {
             // See MainTabView: a rate-limit backoff must not disable Refresh.
             .disabled(toolState.isFetchingQuota)
             .accessibilityLabel(Text("Refresh \(toolState.tool.shortName) quota now"))
+
+            if let onDisable {
+                Spacer(minLength: 4)
+                Button(action: onDisable) {
+                    Label("Turn Off", systemImage: "power")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .frame(height: 32)
+                        .padding(.horizontal, 11)
+                        .foregroundStyle(DS.C.textMuted)
+                        .background(DS.C.surfaceHigh, in: Capsule())
+                        .overlay(Capsule().stroke(DS.C.border, lineWidth: 1))
+                }
+                .buttonStyle(PressableButtonStyle())
+                .help("Turn off \(toolState.tool.displayName) — re-enable anytime in Overview or Settings")
+                .accessibilityLabel(Text("Turn off \(toolState.tool.displayName)"))
+            }
         }
     }
 }

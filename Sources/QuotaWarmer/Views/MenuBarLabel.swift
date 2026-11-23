@@ -15,17 +15,23 @@ enum MenuBarStatus {
     }
 
     private static func isHealthy(_ appState: AppState) -> Bool {
-        guard !appState.globalPassive, !appState.watcherStale else { return false }
+        guard !appState.globalPassive, !appState.watcherStale, !appState.enabledTools.isEmpty else { return false }
         return appState.toolStates.values.allSatisfy { state in
             if !state.isMonitored { return true }
             return state.sourceHealth == .healthy && state.freshness == .fresh
         }
     }
 
-    /// Tools the user has pinned to the menu bar, shown side by side. Order
-    /// follows `ToolID.allCases` so the layout is stable.
+    /// Enabled tools the user has pinned to the menu bar, shown side by side.
+    /// Order follows `ToolID.allCases` so the layout is stable.
     private static func visibleTools(_ appState: AppState) -> [ToolID] {
-        ToolID.allCases.filter { appState.state(for: $0).menuBarVisible }
+        ToolID.allCases.filter {
+            let st = appState.state(for: $0)
+            return ToolEnablementPolicy.effectiveMenuBarVisible(
+                isEnabled: st.isEnabled,
+                menuBarVisible: st.menuBarVisible
+            )
+        }
     }
 
     private static func composeItems(_ appState: AppState) -> [MenuBarComposer.Item] {
@@ -72,7 +78,7 @@ enum MenuBarStatus {
             }
 
             return MenuBarComposer.Item(
-                assetName: tool == .claude ? "ClaudeCode" : "Codex",
+                assetName: tool.assetName,
                 dotColor: nsStatusColor(for: st, appState: appState),
                 text: text,
                 // Follows the menu bar's own appearance instead of assuming a

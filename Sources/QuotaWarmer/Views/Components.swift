@@ -198,6 +198,11 @@ enum ToolStatusCopy {
             return "Claude needs reconnecting. Run claude auth login in Terminal, then Refresh."
         case .codex:
             return "Codex needs reconnecting. Sign in again, then Refresh."
+        case .antigravity:
+            if state.healthMessage.contains("agy CLI was not found") {
+                return "Antigravity isn't open and agy CLI wasn't found. Launch Antigravity or install agy, then Refresh."
+            }
+            return "Antigravity needs sign-in. Run agy in Terminal or open Antigravity, then Refresh."
         }
     }
 

@@ -15,19 +15,32 @@ struct WarmupLog: Identifiable {
 final class ToolState: ObservableObject {
     let tool: ToolID
 
+    /// Master enable switch for this provider. When `false`, the provider is
+    /// completely turned off: hidden from the menu bar, sidebar, and overview,
+    /// with all background polling, notifications, and warmups stopped until
+    /// turned back on.
+    @Published var isEnabled: Bool {
+        didSet { ToolEnablementPolicy.setEnabled(isEnabled, for: tool) }
+    }
+
     /// Source of truth for how this tool is treated. `.monitor` is the safe
     /// default; `.autoWarm` is an explicit opt-in. See `ToolMode`.
     @Published var mode: ToolMode {
         didSet { UserDefaults.standard.set(mode.rawValue, forKey: "toolMode.\(tool.rawValue)") }
     }
 
-    /// Whether QuotaWarmer polls quota for this tool (monitor or auto-warm).
-    var isMonitored: Bool { mode != .off }
+    /// Whether QuotaWarmer polls quota for this tool (enabled + monitor or auto-warm).
+    var isMonitored: Bool {
+        ToolEnablementPolicy.effectiveMonitored(isEnabled: isEnabled, mode: mode)
+    }
     /// Whether automatic warm-up may fire for this tool.
-    var isAutoWarmEnabled: Bool { mode == .autoWarm }
+    var isAutoWarmEnabled: Bool {
+        ToolEnablementPolicy.effectiveAutoWarm(isEnabled: isEnabled, mode: mode)
+    }
 
     /// Whether this tool's glyph + quota is pinned to the menu bar. Independent
-    /// of `mode` — an off/monitor tool can still be watched in the menu bar.
+    /// of `mode` — an off/monitor tool can still be watched in the menu bar
+    /// while enabled; turning the provider off hides it until re-enabled.
     @Published var menuBarVisible: Bool {
         didSet { UserDefaults.standard.set(menuBarVisible, forKey: "menuBarVisible.\(tool.rawValue)") }
     }
@@ -63,6 +76,7 @@ final class ToolState: ObservableObject {
 
     init(tool: ToolID) {
         self.tool = tool
+        self.isEnabled = ToolEnablementPolicy.isEnabled(for: tool)
         self.mode = ToolState.resolveMode(for: tool)
         self.menuBarVisible = UserDefaults.standard.object(forKey: "menuBarVisible.\(tool.rawValue)") as? Bool ?? true
         self.lastAutoWindowKey = UserDefaults.standard.string(forKey: "lastAutoWindowKey.\(tool.rawValue)")
@@ -299,6 +313,65 @@ final class AppState: ObservableObject {
 
     func state(for tool: ToolID) -> ToolState { toolStates[tool]! }
 
+    /// Providers currently turned on by the user, preserving `ToolID.allCases` order.
+    var enabledTools: [ToolID] {
+        ToolID.allCases.filter { state(for: $0).isEnabled }
+    }
+
+    /// Providers currently turned off by the user.
+    var disabledTools: [ToolID] {
+        ToolID.allCases.filter { !state(for: $0).isEnabled }
+    }
+
+    /// Actively turns an entire provider on or off. Turning off stops all
+    /// timers, notifications, credential reads, and warmups and hides the
+    /// provider from the menu bar, sidebar, and overview; turning it back on
+    /// restores its mode (resuming `.monitor` if it was `.off`) and refreshes.
+    func setToolEnabled(_ enabled: Bool, for tool: ToolID) {
+        let state = state(for: tool)
+        guard state.isEnabled != enabled else { return }
+        objectWillChange.send()
+        state.isEnabled = enabled
+
+        if enabled {
+            let restored = ToolEnablementPolicy.restoredModeOnEnable(currentMode: state.mode)
+            if state.mode != restored {
+                state.mode = restored
+            }
+            state.lastLogActivity = scanner.lastActivity(for: tool)
+            state.weeklyActivity = scanner.weeklyActivity(for: tool)
+            addHistory(
+                tool: tool,
+                kind: .quotaFetch,
+                title: "Provider enabled",
+                detail: "\(tool.displayName) turned on (\(state.mode.label))"
+            )
+            if state.isMonitored {
+                Task { await refreshQuota(for: tool, allowAutomaticWarmup: state.isAutoWarmEnabled && !globalPassive) }
+            }
+            Task { await checkOnboarding() }
+        } else {
+            scheduler.invalidate(tool: tool)
+            notifications.cancelAll(for: tool)
+            state.claimVerifyTask?.cancel(); state.claimVerifyTask = nil
+            state.settleRepollTask?.cancel(); state.settleRepollTask = nil
+            clearAuthRetry(for: state)
+            state.nextRefreshAt = nil
+            state.isFetchingQuota = false
+            state.errorMessage = nil
+            if selectedTab == .tool(tool) {
+                selectedTab = .main
+            }
+            addHistory(
+                tool: tool,
+                kind: .quotaFetch,
+                title: "Provider disabled",
+                detail: "\(tool.displayName) turned off — turn back on anytime"
+            )
+            Task { await checkOnboarding() }
+        }
+    }
+
     /// Pins/unpins a tool in the menu bar. Routed through AppState so the
     /// menu-bar label (which observes AppState, not each ToolState) refreshes
     /// immediately when toggled.
@@ -358,7 +431,10 @@ final class AppState: ObservableObject {
 
     func refreshAllActivity(allowAutomaticWarmup: Bool = false, includeInactive: Bool = false) {
         isRefreshing = true
-        let tools = ToolID.allCases.filter { includeInactive || state(for: $0).isMonitored }
+        let tools = ToolID.allCases.filter {
+            let st = state(for: $0)
+            return st.isEnabled && (includeInactive || st.isMonitored)
+        }
         guard !tools.isEmpty else {
             isRefreshing = false
             return
@@ -398,10 +474,12 @@ final class AppState: ObservableObject {
         force: Bool = false
     ) async {
         let state = state(for: tool)
+        guard state.isEnabled else { return }
         // Timer, wake and scheduler callbacks can converge on the same instant.
         // Claude refresh tokens are single-use, so only one Claude request chain
         // may run at a time. Codex keeps its existing behavior unchanged.
         guard tool != .claude || !state.isFetchingQuota else { return }
+        guard tool != .antigravity || !state.isFetchingQuota else { return }
         refreshTokenUsage(for: tool)
         if let backoffUntil = state.quotaBackoffUntil, backoffUntil > Date() {
             // An explicit user request retries now. Clearing the backoff matters
@@ -454,6 +532,7 @@ final class AppState: ObservableObject {
                 // the warm-up path performs its post-command verification fetch;
                 // otherwise the single-flight guard would discard that proof.
                 if tool == .claude { state.isFetchingQuota = false }
+                if tool == .antigravity { state.isFetchingQuota = false }
                 await attemptAutomaticWarmup(tool: tool, reason: "fresh quota")
             }
         } catch {
@@ -826,7 +905,7 @@ final class AppState: ObservableObject {
     @discardableResult
     private func triggerWarmup(tool: ToolID, mode: String) async -> Bool {
         let state = state(for: tool)
-        guard !state.isWarming else { return false }
+        guard state.isEnabled, !state.isWarming else { return false }
 
         state.isWarming = true
         state.errorMessage = nil
@@ -1321,10 +1400,12 @@ final class AppState: ObservableObject {
 
     private func checkOnboarding() async {
         var anyMissing = false
-        for tool in ToolID.allCases {
+        for tool in enabledTools {
             if await runner.cliMissing(tool) { anyMissing = true }
         }
-        if anyMissing && !UserDefaults.standard.bool(forKey: "onboardingDismissed") {
+        if !anyMissing {
+            showOnboarding = false
+        } else if !UserDefaults.standard.bool(forKey: "onboardingDismissed") {
             showOnboarding = true
         }
     }

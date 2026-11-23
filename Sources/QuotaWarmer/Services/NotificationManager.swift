@@ -143,17 +143,13 @@ class NotificationManager {
 }
 
 private extension ToolID {
-    var notificationAssetName: String {
-        switch self {
-        case .claude: return "ClaudeCode"
-        case .codex: return "Codex"
-        }
-    }
+    var notificationAssetName: String { assetName }
 
     var notificationTint: NSColor {
         switch self {
-        case .claude: return .systemOrange
-        case .codex: return .systemPurple
+        case .claude:      return .systemOrange
+        case .codex:       return .systemPurple
+        case .antigravity: return .systemBlue
         }
     }
 }

@@ -22,13 +22,20 @@ class ActivityScanner {
     // MARK: - Public
 
     /// Most-recent message timestamp across all log files (display only).
-    func lastActivity(for tool: ToolID) -> Date? {
-        guard let base = tool.logDirectoryURL,
-              FileManager.default.fileExists(atPath: base.path) else { return nil }
+    func lastActivity(for tool: ToolID, directories: [URL]? = nil) -> Date? {
+        let roots = (directories ?? tool.activityDirectoryURLs).filter {
+            FileManager.default.fileExists(atPath: $0.path)
+        }
+        guard !roots.isEmpty else { return nil }
         var latest: Date?
-        enumerateJSONL(in: base) { url in
-            if let t = self.lastTimestamp(in: url) {
-                if latest == nil || t > latest! { latest = t }
+        for base in roots {
+            enumerateActivityFiles(in: base, tool: tool) { url in
+                let ts: Date? = (url.pathExtension == "jsonl")
+                    ? self.lastTimestamp(in: url)
+                    : self.mtime(of: url)
+                if let t = ts, latest == nil || t > latest! {
+                    latest = t
+                }
             }
         }
         return latest
@@ -37,21 +44,25 @@ class ActivityScanner {
     /// Earliest message timestamp within the current rolling window.
     /// This is the correct scheduling anchor: window expires at windowStart + windowDuration.
     ///
-    /// Approach: scan all JSONL files touched in the last windowDuration seconds,
-    /// find the earliest ISO-8601 timestamp inside them that is also within the window.
+    /// Approach: scan all JSONL/conversation files touched in the last windowDuration seconds,
+    /// find the earliest timestamp inside them that is also within the window.
     /// The Anthropic API would give an exact `resets_at` but is ToS-restricted for
     /// third-party use (Feb 2026). Log-based scanning is ≈ ±1 minute accurate.
-    func windowStartTime(for tool: ToolID) -> Date? {
-        guard let base = tool.logDirectoryURL,
-              FileManager.default.fileExists(atPath: base.path) else { return nil }
+    func windowStartTime(for tool: ToolID, directories: [URL]? = nil) -> Date? {
+        let roots = (directories ?? tool.activityDirectoryURLs).filter {
+            FileManager.default.fileExists(atPath: $0.path)
+        }
+        guard !roots.isEmpty else { return nil }
 
         let windowDuration = tool.windowDuration
         let cutoff = Date().addingTimeInterval(-windowDuration)
 
         var candidates: [(mtime: Date, url: URL)] = []
-        enumerateJSONL(in: base) { url in
-            if let mtime = self.mtime(of: url), mtime >= cutoff {
-                candidates.append((mtime, url))
+        for base in roots {
+            enumerateActivityFiles(in: base, tool: tool) { url in
+                if let mtime = self.mtime(of: url), mtime >= cutoff {
+                    candidates.append((mtime, url))
+                }
             }
         }
 
@@ -61,16 +72,29 @@ class ActivityScanner {
 
         var windowStart: Date?
         for candidate in candidates {
-            if let ts = firstTimestampInWindow(candidate.url, cutoff: cutoff) {
-                if windowStart == nil || ts < windowStart! { windowStart = ts }
+            let ts: Date?
+            if candidate.url.pathExtension == "jsonl" {
+                ts = firstTimestampInWindow(candidate.url, cutoff: cutoff)
+            } else {
+                let created = creationDate(of: candidate.url)
+                if let created, created >= cutoff {
+                    ts = created
+                } else {
+                    ts = candidate.mtime
+                }
+            }
+            if let ts, windowStart == nil || ts < windowStart! {
+                windowStart = ts
             }
         }
         return windowStart
     }
 
-    func weeklyActivity(for tool: ToolID) -> [DayActivity] {
-        guard let base = tool.logDirectoryURL,
-              FileManager.default.fileExists(atPath: base.path) else { return emptyWeek() }
+    func weeklyActivity(for tool: ToolID, directories: [URL]? = nil) -> [DayActivity] {
+        let roots = (directories ?? tool.activityDirectoryURLs).filter {
+            FileManager.default.fileExists(atPath: $0.path)
+        }
+        guard !roots.isEmpty else { return emptyWeek() }
 
         let calendar = Calendar.current
         let now      = Date()
@@ -83,10 +107,15 @@ class ActivityScanner {
             }
         }
 
-        enumerateJSONL(in: base) { url in
-            guard let ts = self.lastTimestamp(in: url), ts >= cutoff else { return }
-            let day = calendar.startOfDay(for: ts)
-            if countsByDay[day] != nil { countsByDay[day]! += 1 }
+        for base in roots {
+            enumerateActivityFiles(in: base, tool: tool) { url in
+                let rawTS = (url.pathExtension == "jsonl")
+                    ? self.lastTimestamp(in: url)
+                    : self.mtime(of: url)
+                guard let ts = rawTS, ts >= cutoff else { return }
+                let day = calendar.startOfDay(for: ts)
+                if countsByDay[day] != nil { countsByDay[day]! += 1 }
+            }
         }
 
         return countsByDay
@@ -141,26 +170,45 @@ class ActivityScanner {
         (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
     }
 
+    private func creationDate(of url: URL) -> Date? {
+        (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+    }
+
     private func parseTimestamp(from jsonLine: String) -> Date? {
         let t = jsonLine.trimmingCharacters(in: .whitespaces)
         guard !t.isEmpty, t.hasPrefix("{"),
               let data = t.data(using: .utf8),
-              let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let ts   = obj["timestamp"] as? String else { return nil }
-        return iso8601Frac.date(from: ts) ?? iso8601.date(from: ts)
+              let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let ts = obj["timestamp"] as? String {
+            return iso8601Frac.date(from: ts) ?? iso8601.date(from: ts)
+        }
+        if let num = obj["timestamp"] as? NSNumber {
+            let val = num.doubleValue
+            if val > 0 {
+                return Date(timeIntervalSince1970: val > 10_000_000_000 ? val / 1000 : val)
+            }
+        }
+        return nil
     }
 
-    private func enumerateJSONL(in directory: URL, handler: (URL) -> Void) {
+    private func enumerateActivityFiles(in directory: URL, tool: ToolID, handler: (URL) -> Void) {
         guard let en = FileManager.default.enumerator(
             at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+            includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else { return }
         var count = 0
         for case let url as URL in en {
             count += 1; if count > 50_000 { break }
-            guard url.pathExtension == "jsonl" else { continue }
-            handler(url)
+            let ext = url.pathExtension.lowercased()
+            if ext == "jsonl" {
+                handler(url)
+            } else if tool == .antigravity, ext == "db" {
+                // Antigravity 1.2.3+ writes an index `conversation_summaries.db`
+                // alongside conversation databases; skip non-session index files.
+                if url.lastPathComponent.lowercased() == "conversation_summaries.db" { continue }
+                handler(url)
+            }
         }
     }
 

@@ -26,7 +26,7 @@ struct OnboardingView: View {
             .overlay(Rectangle().frame(height: 1).foregroundStyle(DS.C.yellow.opacity(0.25)), alignment: .bottom)
 
             VStack(alignment: .leading, spacing: DS.Space.sm) {
-                Text("Warmup needs Claude/Codex binaries in the app environment. Credentials are checked separately below.")
+                Text("Warmup needs CLI binaries for enabled providers in the app environment. Credentials are checked separately below.")
                     .font(.system(size: 11)).foregroundStyle(DS.C.textSub)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -37,7 +37,7 @@ struct OnboardingView: View {
                     }
                 } else {
                     VStack(spacing: 4) {
-                        ForEach(ToolID.allCases) { tool in cliRow(tool) }
+                        ForEach(appState.enabledTools) { tool in cliRow(tool) }
                     }
                 }
             }
@@ -72,8 +72,12 @@ struct OnboardingView: View {
     private func cliRow(_ tool: ToolID) -> some View {
         let found = cliStatus[tool] ?? false
         return HStack(spacing: DS.Space.sm) {
-            Image(tool == .claude ? "ClaudeCode" : "Codex")
-                .resizable().scaledToFit().frame(width: 16, height: 16)
+            Image(tool.assetName)
+                .resizable()
+                .renderingMode(.template)
+                .scaledToFit()
+                .frame(width: 16, height: 16)
+                .foregroundStyle(DS.C.text)
             Text(tool.shortName)
                 .font(.system(size: 11, weight: .medium)).foregroundStyle(DS.C.text)
             Spacer()
@@ -99,7 +103,7 @@ struct OnboardingView: View {
     private func runCheck() async {
         checking = true
         let runner = WarmupRunner()
-        for tool in ToolID.allCases {
+        for tool in appState.enabledTools {
             let missing = await runner.cliMissing(tool)
             await MainActor.run { cliStatus[tool] = !missing }
         }
@@ -114,11 +118,7 @@ struct OnboardingView: View {
     }
 
     private func openInstallPage(for tool: ToolID) {
-        let urls: [ToolID: String] = [
-            .claude: "https://docs.anthropic.com/en/docs/claude-code",
-            .codex:  "https://github.com/openai/codex"
-        ]
-        if let str = urls[tool], let url = URL(string: str) {
+        if let url = URL(string: tool.installURLString) {
             NSWorkspace.shared.open(url)
         }
     }
