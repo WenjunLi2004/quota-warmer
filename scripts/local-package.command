@@ -10,13 +10,12 @@ cd "$ROOT_DIR"
 # Regenerate the Xcode project so newly added/removed sources and any project.yml
 # change (version, entitlements, build settings) are actually part of this build.
 # Without this the build can silently use a stale .xcodeproj.
-if command -v xcodegen >/dev/null 2>&1; then
+if command -v xcodegen >/dev/null 2>&1 && xcodebuild -version >/dev/null 2>&1; then
   echo "Regenerating Xcode project from project.yml..."
   xcodegen generate
 else
-  echo "ERROR: xcodegen not found; cannot guarantee the project matches project.yml."
-  echo "       Install it with: brew install xcodegen"
-  exit 1
+  echo "Local Xcode / xcodegen not found; installing prebuilt universal DMG instead..."
+  exec "$ROOT_DIR/scripts/install-dmg.command"
 fi
 
 echo "Building QuotaWarmer Release..."
