@@ -40,6 +40,10 @@ if [ -n "$XCODE_APP" ]; then
     echo "Accepting Xcode license..."
     sudo xcodebuild -license accept
   fi
+  if ! xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
+    echo "Running Xcode first-launch component setup..."
+    sudo xcodebuild -runFirstLaunch
+  fi
   echo "[OK] Full Xcode toolchain active: $(xcodebuild -version | tr '\n' ' ')"
   echo "Building from local source and restarting QuotaWarmer..."
   exec "$ROOT_DIR/scripts/local-package.command"
