@@ -806,6 +806,7 @@ struct QuotaExtractorRegression {
         testProviderEnableDisableControls()
         testAntigravityQuotaAndParser()
         testAntigravityLocalUsageAndActivity()
+        testSmartSchedulingAndAlertPolicies()
 
         let asyncDone = DispatchSemaphore(value: 0)
         Task.detached {
@@ -1511,5 +1512,123 @@ struct QuotaExtractorRegression {
         } catch {
             fatalError("Expected WarmupError.authenticationRequired for signed-out agy, got \(error)")
         }
+    }
+
+    private static func testSmartSchedulingAndAlertPolicies() {
+        let baseNow = isoDate("2026-04-17T02:15:00Z")
+
+        // 1. SmartRefreshPolicy accelerates right to reset + 5s when reset is sooner than refreshInterval.
+        let farReset = baseNow.addingTimeInterval(2 * 3600)
+        let normalNext = SmartRefreshPolicy.nextRefreshDate(now: baseNow, refreshInterval: 900, windowResetAt: farReset)
+        require(abs(normalNext.timeIntervalSince(baseNow) - 900) < 0.5, "Far reset should keep normal refresh interval")
+
+        let imminentReset = baseNow.addingTimeInterval(40)
+        let acceleratedNext = SmartRefreshPolicy.nextRefreshDate(now: baseNow, refreshInterval: 900, windowResetAt: imminentReset)
+        require(abs(acceleratedNext.timeIntervalSince(baseNow) - 45) < 0.5, "Imminent reset should accelerate poll to resetAt + 5s")
+
+        let pastReset = baseNow.addingTimeInterval(-30)
+        let pastNext = SmartRefreshPolicy.nextRefreshDate(now: baseNow, refreshInterval: 300, windowResetAt: pastReset)
+        require(abs(pastNext.timeIntervalSince(baseNow) - 300) < 0.5, "Past reset should use normal refresh interval")
+
+        // 2. ActiveHoursPolicy supports daytime and overnight spans in UTC.
+        let cal = utcCalendar
+        require(
+            ActiveHoursPolicy.isWithinActiveHours(now: baseNow, enabled: false, startHour: 8, endHour: 23, calendar: cal),
+            "Disabled active-hours guard must allow all hours"
+        )
+        require(
+            !ActiveHoursPolicy.isWithinActiveHours(now: baseNow, enabled: true, startHour: 8, endHour: 23, calendar: cal),
+            "02:15 UTC must be outside 08:00-23:00 active window"
+        )
+        let daytime = isoDate("2026-04-17T10:30:00Z")
+        require(
+            ActiveHoursPolicy.isWithinActiveHours(now: daytime, enabled: true, startHour: 8, endHour: 23, calendar: cal),
+            "10:30 UTC must be inside 08:00-23:00 active window"
+        )
+        require(
+            ActiveHoursPolicy.isWithinActiveHours(now: baseNow, enabled: true, startHour: 22, endHour: 6, calendar: cal),
+            "02:15 UTC must be inside overnight 22:00-06:00 active window"
+        )
+        require(
+            !ActiveHoursPolicy.isWithinActiveHours(now: daytime, enabled: true, startHour: 22, endHour: 6, calendar: cal),
+            "10:30 UTC must be outside overnight 22:00-06:00 active window"
+        )
+        if let nextStart = ActiveHoursPolicy.nextActiveStart(after: baseNow, startHour: 8, calendar: cal) {
+            require(cal.component(.hour, from: nextStart) == 8, "nextActiveStart should land on hour 8")
+            require(nextStart > baseNow, "nextActiveStart must be strictly after now")
+        } else {
+            fatalError("nextActiveStart should resolve a valid date")
+        }
+
+        // 3. LowQuotaAlertPolicy alerts once per active 5h window and ignores rollover artifacts.
+        let activeReset = daytime.addingTimeInterval(3600)
+        let lowSnap = QuotaSnapshot(
+            tool: .codex,
+            fetchedAt: daytime,
+            primarySource: "Codex test",
+            corroboratingSource: nil,
+            fiveHour: QuotaMetric(name: "5h window", usedPercent: 0.82, remainingPercent: 0.18, resetAt: activeReset, detail: nil),
+            weekly: nil,
+            extras: [],
+            rawWindowKey: "codex|low",
+            message: nil
+        )
+        let firstKey = LowQuotaAlertPolicy.shouldAlert(
+            enabled: true,
+            snapshot: lowSnap,
+            windowDuration: 5 * 3600,
+            lastAlertedKey: nil,
+            now: daytime
+        )
+        require(firstKey != nil, "18% remaining on an active 5h window should trigger low-quota alert")
+
+        let jitteredSnap = QuotaSnapshot(
+            tool: .codex,
+            fetchedAt: daytime.addingTimeInterval(60),
+            primarySource: "Codex test",
+            corroboratingSource: nil,
+            fiveHour: QuotaMetric(name: "5h window", usedPercent: 0.85, remainingPercent: 0.15, resetAt: activeReset.addingTimeInterval(20), detail: nil),
+            weekly: nil,
+            extras: [],
+            rawWindowKey: "codex|low2",
+            message: nil
+        )
+        require(
+            LowQuotaAlertPolicy.shouldAlert(
+                enabled: true,
+                snapshot: jitteredSnap,
+                windowDuration: 5 * 3600,
+                lastAlertedKey: firstKey,
+                now: daytime.addingTimeInterval(60)
+            ) == nil,
+            "Same 5h window with minor reset_after_seconds jitter must not duplicate low-quota alert"
+        )
+
+        let unsettledSnap = QuotaSnapshot(
+            tool: .claude,
+            fetchedAt: daytime,
+            primarySource: "Claude test",
+            corroboratingSource: nil,
+            fiveHour: QuotaMetric(name: "5h window", usedPercent: 0.99, remainingPercent: 0.01, resetAt: daytime.addingTimeInterval(5 * 3600 - 60), detail: nil),
+            weekly: nil,
+            extras: [],
+            rawWindowKey: "claude|unsettled",
+            message: nil
+        )
+        require(
+            LowQuotaAlertPolicy.shouldAlert(
+                enabled: true,
+                snapshot: unsettledSnap,
+                windowDuration: 5 * 3600,
+                lastAlertedKey: nil,
+                now: daytime
+            ) == nil,
+            "Unsettled rollover artifact right after window open must not fire false low-quota alert"
+        )
+
+        // 4. MenuBarDisplayStyle resolution.
+        require(MenuBarDisplayStyle.resolve(rawValue: nil) == .both, "Default menu bar style should be .both")
+        require(MenuBarDisplayStyle.resolve(rawValue: "percent") == .percentOnly, "Percent menu bar style should resolve")
+        require(MenuBarDisplayStyle.resolve(rawValue: "countdown") == .countdownOnly, "Countdown menu bar style should resolve")
     }
 }

@@ -55,7 +55,7 @@ enum MenuBarStatus {
                 // would make a not-yet-started window look active.
                 text = "\(Int((st.primaryMetric?.remainingFraction ?? 1) * 100))%"
             } else if let r = st.timeUntilReset {
-                text = compactQuotaText(time: r, metric: st.primaryMetric)
+                text = compactQuotaText(time: r, metric: st.primaryMetric, style: appState.menuBarDisplayStyle)
             } else if st.primaryWindowRolledOver {
                 // The known reset already passed while polling was blocked, so the
                 // window rolled over and quota is restored. Report that instead of
@@ -103,10 +103,17 @@ enum MenuBarStatus {
         return "\(h):\(String(format: "%02d", m))"
     }
 
-    private static func compactQuotaText(time: TimeInterval, metric: QuotaMetric?) -> String {
+    private static func compactQuotaText(time: TimeInterval, metric: QuotaMetric?, style: MenuBarDisplayStyle) -> String {
         let percent = Int((metric?.remainingFraction ?? 0) * 100)
-        // Middle dot rather than a hyphen: "1h05m - 71%" reads as a subtraction.
-        return "\(compactTime(time)) · \(percent)%"
+        switch style {
+        case .both:
+            // Middle dot rather than a hyphen: "1h05m - 71%" reads as a subtraction.
+            return "\(compactTime(time)) · \(percent)%"
+        case .percentOnly:
+            return "\(percent)%"
+        case .countdownOnly:
+            return compactTime(time)
+        }
     }
 
     /// Nil while the tool is healthy and warming. A badge that is green

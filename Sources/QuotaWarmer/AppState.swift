@@ -61,6 +61,9 @@ final class ToolState: ObservableObject {
     @Published var authRetryScheduledAt: Date?
     @Published var confirmedWarmupResetAt: Date?
     @Published var lastAutoWindowKey: String?
+    var lastLowQuotaAlertKey: String? {
+        didSet { UserDefaults.standard.set(lastLowQuotaAlertKey, forKey: "lastLowQuotaAlertKey.\(tool.rawValue)") }
+    }
     /// When the window we last auto-warmed will reset. Until then, the auto path
     /// won't warm again — a dedup that survives providers whose reported reset
     /// time drifts between polls (e.g. Codex `reset_after_seconds`).
@@ -80,6 +83,7 @@ final class ToolState: ObservableObject {
         self.mode = ToolState.resolveMode(for: tool)
         self.menuBarVisible = UserDefaults.standard.object(forKey: "menuBarVisible.\(tool.rawValue)") as? Bool ?? true
         self.lastAutoWindowKey = UserDefaults.standard.string(forKey: "lastAutoWindowKey.\(tool.rawValue)")
+        self.lastLowQuotaAlertKey = UserDefaults.standard.string(forKey: "lastLowQuotaAlertKey.\(tool.rawValue)")
         if let storedEnds = UserDefaults.standard.object(forKey: "lastAutoWarmEndsAt.\(tool.rawValue)") as? TimeInterval {
             let endsAt = Date(timeIntervalSince1970: storedEnds)
             if endsAt > Date() {
@@ -523,6 +527,17 @@ final class AppState: ObservableObject {
             )
             rescheduleRefresh(for: tool)
 
+            if let alertKey = LowQuotaAlertPolicy.shouldAlert(
+                enabled: notifyLowQuota,
+                snapshot: snapshot,
+                windowDuration: tool.windowDuration,
+                lastAlertedKey: state.lastLowQuotaAlertKey
+            ), let metric = snapshot.fiveHour {
+                state.lastLowQuotaAlertKey = alertKey
+                let pct = Int((metric.remainingFraction * 100).rounded())
+                notifications.notifyLowQuota(tool: tool, remainingPercent: pct, resetAt: metric.resetAt)
+            }
+
             // A successful OAuth quota response is stronger evidence than the
             // headless `claude auth status` probe, which can report logged-out
             // even while the real Claude CLI and OAuth credential are usable.
@@ -617,7 +632,25 @@ final class AppState: ObservableObject {
         startQuotaRefreshTimer()
         startUIRefreshTimer()
         for tool in ToolID.allCases where state(for: tool).isMonitored {
-            state(for: tool).nextRefreshAt = Date().addingTimeInterval(refreshInterval)
+            rescheduleRefresh(for: tool)
+        }
+    }
+
+    func applyMenuBarDisplayStyle() {
+        objectWillChange.send()
+    }
+
+    func applyActiveHours() {
+        objectWillChange.send()
+        for tool in ToolID.allCases where state(for: tool).isMonitored {
+            rescheduleRefresh(for: tool)
+        }
+        if ActiveHoursPolicy.isWithinActiveHours(
+            enabled: activeHoursEnabled,
+            startHour: activeHoursStart,
+            endHour: activeHoursEnd
+        ) {
+            refreshAllActivity(allowAutomaticWarmup: true)
         }
     }
 
@@ -737,7 +770,7 @@ final class AppState: ObservableObject {
             )
 
             guard case .run(let caughtUp) = decision else { continue }
-            guard canAttemptManagedWarmup(for: tool) else { continue }
+            guard canAttemptManagedWarmup(for: tool, ignoreActiveHours: true) else { continue }
 
             let previousQuotaFetchedAt = state(for: tool).quotaSnapshot?.fetchedAt
             let succeeded = await triggerWarmup(
@@ -870,10 +903,18 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func canAttemptManagedWarmup(for tool: ToolID) -> Bool {
+    private func canAttemptManagedWarmup(for tool: ToolID, ignoreActiveHours: Bool = false) -> Bool {
         let state = state(for: tool)
         guard state.isAutoWarmEnabled, !globalPassive, !state.isWarming else { return false }
         guard state.authStatus != .failed, state.authStatus != .missing else { return false }
+        if !ignoreActiveHours,
+           !ActiveHoursPolicy.isWithinActiveHours(
+               enabled: activeHoursEnabled,
+               startHour: activeHoursStart,
+               endHour: activeHoursEnd
+           ) {
+            return false
+        }
         if UserDefaults.standard.object(forKey: "rateLimitGuard") as? Bool ?? true,
            let backoffUntil = state.backoffUntil,
            backoffUntil > Date() {
@@ -1343,14 +1384,30 @@ final class AppState: ObservableObject {
             state.nextRefreshAt = nil
             return
         }
-        let nextDate = Date().addingTimeInterval(refreshInterval)
+        let now = Date()
+        var nextDate = SmartRefreshPolicy.nextRefreshDate(
+            now: now,
+            refreshInterval: refreshInterval,
+            windowResetAt: state.realWindowResetAt
+        )
+        if activeHoursEnabled,
+           state.isAutoWarmEnabled,
+           !ActiveHoursPolicy.isWithinActiveHours(
+               now: now,
+               enabled: true,
+               startHour: activeHoursStart,
+               endHour: activeHoursEnd
+           ),
+           let activeStart = ActiveHoursPolicy.nextActiveStart(after: now, startHour: activeHoursStart) {
+            nextDate = min(nextDate, activeStart)
+        }
         scheduler.schedule(tool: tool, at: nextDate)
         state.nextRefreshAt = nextDate
         // Use the *real* window reset, not the idle "if you started now"
         // projection that `resetAt` falls back to — otherwise an idle window
         // (e.g. Claude's null `five_hour`) would schedule a misleading
         // "window expiring soon" notification for a window that never opened.
-        if let resetAt = state.realWindowResetAt, resetAt > Date() {
+        if let resetAt = state.realWindowResetAt, resetAt > now {
             notifications.scheduleWindowWarning(for: tool, expiresAt: resetAt)
         }
     }
@@ -1382,6 +1439,26 @@ final class AppState: ObservableObject {
     private var refreshInterval: TimeInterval {
         let stored = UserDefaults.standard.integer(forKey: "refreshInterval")
         return TimeInterval(stored.nonZero ?? 300)
+    }
+
+    var menuBarDisplayStyle: MenuBarDisplayStyle {
+        MenuBarDisplayStyle.resolve(rawValue: UserDefaults.standard.string(forKey: "menuBarDisplayStyle"))
+    }
+
+    var activeHoursEnabled: Bool {
+        UserDefaults.standard.object(forKey: "activeHoursEnabled") as? Bool ?? false
+    }
+
+    var activeHoursStart: Int {
+        UserDefaults.standard.object(forKey: "activeHoursStart") as? Int ?? 8
+    }
+
+    var activeHoursEnd: Int {
+        UserDefaults.standard.object(forKey: "activeHoursEnd") as? Int ?? 23
+    }
+
+    var notifyLowQuota: Bool {
+        UserDefaults.standard.object(forKey: "notifyLowQuota") as? Bool ?? true
     }
 
     private func addHistory(tool: ToolID?, kind: HistoryKind, title: String, detail: String) {

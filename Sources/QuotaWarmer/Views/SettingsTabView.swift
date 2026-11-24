@@ -4,11 +4,16 @@ import ServiceManagement
 struct SettingsTabView: View {
     @EnvironmentObject var appState: AppState
 
-    @AppStorage("refreshInterval")   private var refreshInterval: Int    = 300
-    @AppStorage("notifyWarning")     private var notifyWarning: Bool     = true
-    @AppStorage("notifyActivated")   private var notifyActivated: Bool   = true
-    @AppStorage("launchAtLogin")     private var launchAtLogin: Bool     = false
-    @AppStorage("rateLimitGuard")    private var rateLimitGuard: Bool    = true
+    @AppStorage("refreshInterval")      private var refreshInterval: Int         = 300
+    @AppStorage("notifyWarning")        private var notifyWarning: Bool          = true
+    @AppStorage("notifyActivated")      private var notifyActivated: Bool        = true
+    @AppStorage("notifyLowQuota")       private var notifyLowQuota: Bool         = true
+    @AppStorage("launchAtLogin")        private var launchAtLogin: Bool          = false
+    @AppStorage("rateLimitGuard")       private var rateLimitGuard: Bool         = true
+    @AppStorage("menuBarDisplayStyle")  private var menuBarDisplayStyle: String  = MenuBarDisplayStyle.both.rawValue
+    @AppStorage("activeHoursEnabled")   private var activeHoursEnabled: Bool     = false
+    @AppStorage("activeHoursStart")     private var activeHoursStart: Int        = 8
+    @AppStorage("activeHoursEnd")       private var activeHoursEnd: Int          = 23
 
     @AppStorage("morningPrewarmHour")         private var morningHour: Int         = 6
     @AppStorage("morningPrewarmMinute")       private var morningMinute: Int       = 0
@@ -16,6 +21,12 @@ struct SettingsTabView: View {
 
     private let refreshOptions: [(label: String, value: Int)] = [
         ("5m", 300), ("10m", 600), ("15m", 900), ("30m", 1800)
+    ]
+
+    private let menuBarStyleOptions: [(label: String, value: String)] = [
+        ("Both", MenuBarDisplayStyle.both.rawValue),
+        ("%", MenuBarDisplayStyle.percentOnly.rawValue),
+        ("Timer", MenuBarDisplayStyle.countdownOnly.rawValue)
     ]
 
     var body: some View {
@@ -34,11 +45,51 @@ struct SettingsTabView: View {
 
                 group("CHECKS") {
                     row(icon: "clock.arrow.2.circlepath", title: "Quota Refresh Interval",
-                        subtitle: "Default 5 minutes") {
+                        subtitle: "Auto-accelerates right at window reset") {
                         segmentedPicker(
                             options: refreshOptions,
                             selected: $refreshInterval
                         ) { appState.applyRefreshInterval() }
+                    }
+
+                    Divider().background(DS.C.border).padding(.leading, 36)
+
+                    row(icon: "moon.zzz", title: "Active Hours Guard",
+                        subtitle: "Pause auto-warm overnight to save weekly quota") {
+                        Toggle("", isOn: $activeHoursEnabled)
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
+                            .onChange(of: activeHoursEnabled) { _, _ in appState.applyActiveHours() }
+                    }
+
+                    if activeHoursEnabled {
+                        Divider().background(DS.C.border).padding(.leading, 36)
+
+                        row(icon: "deskclock", title: "Active Window",
+                            subtitle: "Auto-warm only within this span") {
+                            HStack(spacing: 4) {
+                                Picker("", selection: $activeHoursStart) {
+                                    ForEach(0..<24, id: \.self) { h in
+                                        Text(String(format: "%02d:00", h)).tag(h)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 68)
+                                .onChange(of: activeHoursStart) { _, _ in appState.applyActiveHours() }
+
+                                Text("–")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(DS.C.textMuted)
+
+                                Picker("", selection: $activeHoursEnd) {
+                                    ForEach(0..<24, id: \.self) { h in
+                                        Text(String(format: "%02d:00", h)).tag(h)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 68)
+                                .onChange(of: activeHoursEnd) { _, _ in appState.applyActiveHours() }
+                            }
+                        }
                     }
 
                     Divider().background(DS.C.border).padding(.leading, 36)
@@ -112,6 +163,14 @@ struct SettingsTabView: View {
                 }
 
                 group("ALERTS") {
+                    row(icon: "exclamationmark.triangle", title: "Low Quota Warning",
+                        subtitle: "When 5h quota drops to 20% or less") {
+                        Toggle("", isOn: $notifyLowQuota)
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
+                    }
+
+                    Divider().background(DS.C.border).padding(.leading, 36)
+
                     row(icon: "bell.badge", title: "Window Expiring Soon",
                         subtitle: "30 min before reset") {
                         Toggle("", isOn: $notifyWarning)
@@ -128,6 +187,16 @@ struct SettingsTabView: View {
                 }
 
                 group("SYSTEM") {
+                    row(icon: "menubar.rectangle", title: "Menu Bar Readout",
+                        subtitle: "Compact mode fits more pinned tools") {
+                        segmentedPicker(
+                            options: menuBarStyleOptions,
+                            selected: $menuBarDisplayStyle
+                        ) { appState.applyMenuBarDisplayStyle() }
+                    }
+
+                    Divider().background(DS.C.border).padding(.leading, 36)
+
                     row(icon: "power", title: "Launch at Login",
                         subtitle: "Start with macOS") {
                         Toggle("", isOn: $launchAtLogin)
@@ -384,9 +453,9 @@ struct SettingsTabView: View {
         .padding(.vertical, DS.Space.sm + 2)
     }
 
-    private func segmentedPicker(
-        options: [(label: String, value: Int)],
-        selected: Binding<Int>,
+    private func segmentedPicker<Value: Hashable>(
+        options: [(label: String, value: Value)],
+        selected: Binding<Value>,
         onChange: @escaping () -> Void = {}
     ) -> some View {
         HStack(spacing: 2) {

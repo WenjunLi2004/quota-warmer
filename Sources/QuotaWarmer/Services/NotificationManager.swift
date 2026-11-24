@@ -11,6 +11,11 @@ class NotificationManager {
     }
 
     func scheduleWindowWarning(for tool: ToolID, expiresAt: Date) {
+        let enabled = UserDefaults.standard.object(forKey: "notifyWarning") as? Bool ?? true
+        guard enabled else {
+            cancelPending(id: warningID(tool))
+            return
+        }
         let warnDate = expiresAt.addingTimeInterval(-1800)
         guard warnDate > Date() else { return }
 
@@ -26,6 +31,29 @@ class NotificationManager {
             repeats: false
         )
         let req = UNNotificationRequest(identifier: warningID(tool), content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    func notifyLowQuota(tool: ToolID, remainingPercent: Int, resetAt: Date?) {
+        let content = UNMutableNotificationContent()
+        content.title = "\(tool.displayName) — Low Quota (\(remainingPercent)% left)"
+        if let resetAt, resetAt > Date() {
+            let mins = max(1, Int(resetAt.timeIntervalSinceNow / 60))
+            let timeStr = mins >= 60 ? "\(mins / 60)h \(mins % 60)m" : "\(mins)m"
+            content.body = "5-hour window is down to \(remainingPercent)% remaining (resets in \(timeStr))."
+        } else {
+            content.body = "5-hour window is down to \(remainingPercent)% remaining."
+        }
+        content.sound = .default
+        if let attachment = brandedAttachment(for: tool) {
+            content.attachments = [attachment]
+        }
+
+        let req = UNNotificationRequest(
+            identifier: "lowQuota.\(tool.rawValue).\(Int(Date().timeIntervalSince1970))",
+            content: content,
+            trigger: nil
+        )
         UNUserNotificationCenter.current().add(req)
     }
 
@@ -48,6 +76,8 @@ class NotificationManager {
     }
 
     func notifyActivated(tool: ToolID) {
+        let enabled = UserDefaults.standard.object(forKey: "notifyActivated") as? Bool ?? true
+        guard enabled else { return }
         let content = UNMutableNotificationContent()
         content.title = "\(tool.displayName) — Window Started"
         content.body  = "5-hour quota window is now active. Next auto-trigger in 5 hours."
