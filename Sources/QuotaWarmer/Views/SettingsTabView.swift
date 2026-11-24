@@ -4,11 +4,16 @@ import ServiceManagement
 struct SettingsTabView: View {
     @EnvironmentObject var appState: AppState
 
-    @AppStorage("refreshInterval")   private var refreshInterval: Int    = 300
-    @AppStorage("notifyWarning")     private var notifyWarning: Bool     = true
-    @AppStorage("notifyActivated")   private var notifyActivated: Bool   = true
-    @AppStorage("launchAtLogin")     private var launchAtLogin: Bool     = false
-    @AppStorage("rateLimitGuard")    private var rateLimitGuard: Bool    = true
+    @AppStorage("refreshInterval")      private var refreshInterval: Int         = 300
+    @AppStorage("notifyWarning")        private var notifyWarning: Bool          = true
+    @AppStorage("notifyActivated")      private var notifyActivated: Bool        = true
+    @AppStorage("notifyLowQuota")       private var notifyLowQuota: Bool         = true
+    @AppStorage("launchAtLogin")        private var launchAtLogin: Bool          = false
+    @AppStorage("rateLimitGuard")       private var rateLimitGuard: Bool         = true
+    @AppStorage("menuBarDisplayStyle")  private var menuBarDisplayStyle: String  = MenuBarDisplayStyle.both.rawValue
+    @AppStorage("activeHoursEnabled")   private var activeHoursEnabled: Bool     = false
+    @AppStorage("activeHoursStart")     private var activeHoursStart: Int        = 8
+    @AppStorage("activeHoursEnd")       private var activeHoursEnd: Int          = 23
 
     @AppStorage("morningPrewarmHour")         private var morningHour: Int         = 6
     @AppStorage("morningPrewarmMinute")       private var morningMinute: Int       = 0
@@ -18,14 +23,29 @@ struct SettingsTabView: View {
         ("5m", 300), ("10m", 600), ("15m", 900), ("30m", 1800)
     ]
 
+    private let menuBarStyleOptions: [(label: String, value: String)] = [
+        ("Both", MenuBarDisplayStyle.both.rawValue),
+        ("%", MenuBarDisplayStyle.percentOnly.rawValue),
+        ("Timer", MenuBarDisplayStyle.countdownOnly.rawValue)
+    ]
+
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 0) {
                 settingsHeader
 
+                group("PROVIDERS") {
+                    ForEach(Array(ToolID.allCases.enumerated()), id: \.element.id) { index, tool in
+                        if index > 0 {
+                            Divider().background(DS.C.border).padding(.leading, 36)
+                        }
+                        providerToggleRow(tool)
+                    }
+                }
+
                 group("CHECKS") {
                     row(icon: "clock.arrow.2.circlepath", title: "Quota Refresh Interval",
-                        subtitle: "Default 5 minutes") {
+                        subtitle: "Auto-accelerates right at window reset") {
                         segmentedPicker(
                             options: refreshOptions,
                             selected: $refreshInterval
@@ -34,10 +54,50 @@ struct SettingsTabView: View {
 
                     Divider().background(DS.C.border).padding(.leading, 36)
 
+                    row(icon: "moon.zzz", title: "Active Hours Guard",
+                        subtitle: "Pause auto-warm overnight to save weekly quota") {
+                        Toggle("", isOn: $activeHoursEnabled)
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
+                            .onChange(of: activeHoursEnabled) { _, _ in appState.applyActiveHours() }
+                    }
+
+                    if activeHoursEnabled {
+                        Divider().background(DS.C.border).padding(.leading, 36)
+
+                        row(icon: "deskclock", title: "Active Window",
+                            subtitle: "Auto-warm only within this span") {
+                            HStack(spacing: 4) {
+                                Picker("", selection: $activeHoursStart) {
+                                    ForEach(0..<24, id: \.self) { h in
+                                        Text(String(format: "%02d:00", h)).tag(h)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 68)
+                                .onChange(of: activeHoursStart) { _, _ in appState.applyActiveHours() }
+
+                                Text("–")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(DS.C.textMuted)
+
+                                Picker("", selection: $activeHoursEnd) {
+                                    ForEach(0..<24, id: \.self) { h in
+                                        Text(String(format: "%02d:00", h)).tag(h)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 68)
+                                .onChange(of: activeHoursEnd) { _, _ in appState.applyActiveHours() }
+                            }
+                        }
+                    }
+
+                    Divider().background(DS.C.border).padding(.leading, 36)
+
                     row(icon: "shield.lefthalf.filled", title: "Rate-limit Guard",
                         subtitle: "Back off after failures") {
                         Toggle("", isOn: $rateLimitGuard)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                     }
 
                     Divider().background(DS.C.border).padding(.leading, 36)
@@ -64,7 +124,7 @@ struct SettingsTabView: View {
                             get: { appState.morningPrewarmEnabled },
                             set: { appState.setMorningPrewarm($0) }
                         ))
-                        .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                        .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                     }
 
                     Divider().background(DS.C.border).padding(.leading, 36)
@@ -83,7 +143,7 @@ struct SettingsTabView: View {
                     row(icon: "calendar", title: "Weekdays Only",
                         subtitle: "Skip Saturday and Sunday") {
                         Toggle("", isOn: $morningWeekdaysOnly)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                             .onChange(of: morningWeekdaysOnly) { _, _ in appState.morningTimeChanged() }
                     }
 
@@ -103,10 +163,18 @@ struct SettingsTabView: View {
                 }
 
                 group("ALERTS") {
+                    row(icon: "exclamationmark.triangle", title: "Low Quota Warning",
+                        subtitle: "When 5h quota drops to 20% or less") {
+                        Toggle("", isOn: $notifyLowQuota)
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
+                    }
+
+                    Divider().background(DS.C.border).padding(.leading, 36)
+
                     row(icon: "bell.badge", title: "Window Expiring Soon",
                         subtitle: "30 min before reset") {
                         Toggle("", isOn: $notifyWarning)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                     }
 
                     Divider().background(DS.C.border).padding(.leading, 36)
@@ -114,15 +182,25 @@ struct SettingsTabView: View {
                     row(icon: "checkmark.circle", title: "Window Activated",
                         subtitle: "After warmup succeeds") {
                         Toggle("", isOn: $notifyActivated)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                     }
                 }
 
                 group("SYSTEM") {
+                    row(icon: "menubar.rectangle", title: "Menu Bar Readout",
+                        subtitle: "Compact mode fits more pinned tools") {
+                        segmentedPicker(
+                            options: menuBarStyleOptions,
+                            selected: $menuBarDisplayStyle
+                        ) { appState.applyMenuBarDisplayStyle() }
+                    }
+
+                    Divider().background(DS.C.border).padding(.leading, 36)
+
                     row(icon: "power", title: "Launch at Login",
                         subtitle: "Start with macOS") {
                         Toggle("", isOn: $launchAtLogin)
-                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.claude))
+                            .toggleStyle(.switch).scaleEffect(0.75).tint(DS.C.accent(.codex))
                             .onChange(of: launchAtLogin) { _, v in
                                 try? v ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
                             }
@@ -132,12 +210,12 @@ struct SettingsTabView: View {
                 group("HOW IT WORKS") {
                     transparencyRow(
                         "What QuotaWarmer does",
-                        "It watches your own Claude Code and Codex quota windows. Only for tools you switch to Auto-warm, it sends a single minimal \"hi\" through the CLI you're already logged into, the moment a fresh window opens."
+                        "It watches your enabled Claude Code, Codex, and Antigravity quota windows. Only for tools you switch to Auto-warm, it sends a single minimal \"hi\" through the CLI you're already signed into, the moment a fresh window opens."
                     )
                     Divider().background(DS.C.border).padding(.leading, 36)
                     transparencyRow(
                         "What it never does",
-                        "It never bypasses or raises your limits, never shares or uploads your credentials, and never sends anything for tools left on Monitor or Off."
+                        "It never bypasses or raises your limits, never shares or uploads your credentials, and never polls or sends anything for providers you turn off."
                     )
                     Divider().background(DS.C.border).padding(.leading, 36)
                     transparencyRow(
@@ -149,7 +227,7 @@ struct SettingsTabView: View {
                 group("PRIVACY") {
                     infoRow(
                         title: "Credential access",
-                        detail: "Monitored tools only. Claude reads Keychain Claude Code-credentials, env CLAUDE_CODE_OAUTH_TOKEN, or ~/.claude/.credentials.json. Codex reads auth.json or Keychain Codex Auth."
+                        detail: "Enabled & monitored tools only. Claude reads Keychain Claude Code-credentials, env CLAUDE_CODE_OAUTH_TOKEN, or ~/.claude/.credentials.json. Codex reads auth.json or Keychain Codex Auth. Antigravity reads your local Antigravity server or agy /usage."
                     )
                     Divider().background(DS.C.border).padding(.leading, 36)
                     infoRow(
@@ -303,6 +381,42 @@ struct SettingsTabView: View {
         .padding(.vertical, DS.Space.sm + 2)
     }
 
+    private func providerToggleRow(_ tool: ToolID) -> some View {
+        let state = appState.state(for: tool)
+        let subtitle = state.isEnabled
+            ? "Enabled · \(state.mode.label)"
+            : "Turned off — hidden & not checked"
+
+        return HStack(spacing: DS.Space.sm) {
+            Image(tool.assetName)
+                .resizable()
+                .renderingMode(.template)
+                .scaledToFit()
+                .frame(width: 15, height: 15)
+                .foregroundStyle(state.isEnabled ? DS.C.text : DS.C.textMuted)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(tool.displayName)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(state.isEnabled ? DS.C.text : DS.C.textSub)
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(DS.C.textMuted)
+            }
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { state.isEnabled },
+                set: { appState.setToolEnabled($0, for: tool) }
+            ))
+            .toggleStyle(.switch)
+            .scaleEffect(0.75)
+            .tint(DS.C.accent(tool))
+            .accessibilityLabel(Text("Enable \(tool.displayName)"))
+        }
+        .padding(.horizontal, DS.Space.md)
+        .padding(.vertical, DS.Space.sm + 2)
+    }
+
     private func privacyLine(_ title: String, _ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
@@ -339,9 +453,9 @@ struct SettingsTabView: View {
         .padding(.vertical, DS.Space.sm + 2)
     }
 
-    private func segmentedPicker(
-        options: [(label: String, value: Int)],
-        selected: Binding<Int>,
+    private func segmentedPicker<Value: Hashable>(
+        options: [(label: String, value: Value)],
+        selected: Binding<Value>,
         onChange: @escaping () -> Void = {}
     ) -> some View {
         HStack(spacing: 2) {

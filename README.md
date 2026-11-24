@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A compact macOS menu bar app that keeps your Claude Code and Codex CLI quota windows warm — it watches your rolling 5-hour windows and, when you ask it to, claims a fresh one the moment it opens instead of waiting for you to remember.
+A compact macOS menu bar app that keeps your Claude Code, Codex CLI, and Antigravity quota windows warm — it watches your rolling 5-hour windows and, when you ask it to, claims a fresh one the moment it opens instead of waiting for you to remember.
 
 <p align="center">
   <img src="docs/images/panel-overview-light.png" alt="QuotaWarmer overview panel, light" width="360">
@@ -12,17 +12,18 @@ A compact macOS menu bar app that keeps your Claude Code and Codex CLI quota win
   <img src="docs/images/menu-bar.png" alt="QuotaWarmer menu bar readout" height="20">
 </p>
 
-By default it only **monitors**: it watches live quota snapshots and shows each provider's window in the menu bar. Switch a tool to **Auto-warm** and it also sends a minimal warm-up command through your own logged-in CLI the instant a fresh window opens, then verifies the window actually started.
+By default it only **monitors**: it watches live quota snapshots and shows each provider's window in the menu bar. Switch a tool to **Auto-warm** and it also sends a minimal warm-up command through your own logged-in CLI the instant a fresh window opens, then verifies the window actually started. Any provider you aren't currently using (for example Claude Code) can be completely turned off and turned back on whenever you need it.
 
 ## This Repository
 
-This is a personal fork of [bcanozgur/quota-warmer](https://github.com/bcanozgur/quota-warmer), kept because the upstream project's only tagged release carried a credential bug (see [Credits](#credits)) and I needed a build without it for my own daily setup — a Mac that wakes at 7am, warms both tools, and keeps re-claiming windows through the day with no input from me. On top of that starting point I redesigned the panel to follow the system's own light/dark palette instead of a fixed hex one, fixed the recurring Keychain approval prompt, and made auto-warm resilient to the quota-check API being rate-limited (which, it turns out, happens for hours at a stretch and used to stall the whole thing).
+This is a personal fork of [bcanozgur/quota-warmer](https://github.com/bcanozgur/quota-warmer), kept because the upstream project's only tagged release carried a credential bug (see [Credits](#credits)) and I needed a build without it for my own daily setup — a Mac that wakes at 7am, warms my active tools, and keeps re-claiming windows through the day with no input from me. On top of that starting point I redesigned the panel to follow the system's own light/dark palette instead of a fixed hex one, fixed the recurring Keychain approval prompt, added Google Antigravity support plus per-provider on/off switches, and made auto-warm resilient to the quota-check API being rate-limited (which, it turns out, happens for hours at a stretch and used to stall the whole thing).
 
 ## Highlights
 
-- **Three modes per tool**: **Off**, **Monitor only** (watch quota, never send anything — the default), or **Auto-warm** (claim fresh windows automatically).
+- **Per-provider master toggle**: completely turn off any provider you aren't using right now (hiding it from the menu bar, sidebar, and overview and stopping all background checks), and turn it back on anytime with one click from Overview, Settings → Providers, or the menu bar right-click menu.
+- **Three modes per enabled tool**: **Off**, **Monitor only** (watch quota, never send anything — the default), or **Auto-warm** (claim fresh windows automatically).
 - **Menu bar status at a glance**: provider glyph, a clock-style countdown, and remaining quota percentage — quiet when healthy, a colored badge only when something needs attention.
-- **Claude Code and Codex CLI support**: each provider is monitored, refreshed, and warmed independently.
+- **Claude Code, Codex CLI, and Antigravity support**: each provider is monitored, refreshed, and warmed independently.
 - **Resilient auto-warm**: if the live quota check is unavailable, auto-warm falls back to real local CLI activity on disk to decide whether a window needs claiming — a rate-limited status API no longer stalls the thing this app exists to do.
 - **Window claim receipt**: after a warm-up, QuotaWarmer re-checks quota to confirm the window actually opened, so "sent" never quietly means "missed."
 - **Liveness watchdog**: if the app ever stops checking quota, the menu bar and popover say so instead of looking healthy.
@@ -33,26 +34,29 @@ This is a personal fork of [bcanozgur/quota-warmer](https://github.com/bcanozgur
 
 ## Is This Allowed?
 
-QuotaWarmer uses capacity you already pay for, through the official CLI you're already signed into. It never bypasses or raises your limits, never shares or uploads your credentials, and sends nothing at all for tools left on Monitor or Off. Providers may change their APIs at any time; if automated warm-up is ever disallowed, set a tool to Monitor and QuotaWarmer keeps tracking your quota.
+QuotaWarmer uses capacity you already pay for, through the official CLI you're already signed into. It never bypasses or raises your limits, never shares or uploads your credentials, and sends nothing at all for tools left on Monitor, Off, or turned off. Providers may change their APIs at any time; if automated warm-up is ever disallowed, set a tool to Monitor and QuotaWarmer keeps tracking your quota.
 
 ## How It Works
 
-Claude Code and Codex CLI use rolling quota windows. If a window starts only when you remember to open the CLI, part of the available time goes to waste.
+Claude Code, Codex CLI, and Antigravity use rolling 5-hour quota windows alongside weekly limits. If a window starts only when you remember to open the CLI, part of the available time goes to waste.
 
-QuotaWarmer runs quietly in the menu bar and periodically checks quota state for monitored providers. For a tool set to Auto-warm, when a fresh window is detected — either from a live quota reading, or, if that check is unavailable, from the absence of any recent local CLI activity — it runs a minimal warm-up command from an isolated temporary working directory:
+QuotaWarmer runs quietly in the menu bar and periodically checks quota state for enabled, monitored providers (for Antigravity, reading the running Antigravity Desktop / IDE local server first and falling back to zero-token `agy -p /usage --output-format json`). For a tool set to Auto-warm, when a fresh window is detected — either from a live quota reading, or, if that check is unavailable, from the absence of any recent local CLI activity — it runs a minimal warm-up command from an isolated temporary working directory:
 
 ```bash
 claude --model haiku --effort low --no-session-persistence --max-turns 1 --tools '' -p 'hi'
 codex exec -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral --ignore-rules 'hi'
+agy --effort low --print-timeout 45s -p 'hi'
 ```
 
-Codex runs with whatever model your Codex config defaults to, rather than a pinned one — a pinned model eventually gets retired (`gpt-5.4-mini` did, for ChatGPT accounts). If ChatGPT.app is installed, its bundled `codex` is preferred over a global npm install, because an npm install doesn't update itself and older clients get refused for current models.
+Codex and Antigravity run with whatever model your config defaults to, rather than a pinned one — a pinned model eventually gets retired (`gpt-5.4-mini` did for ChatGPT accounts, and `agy` headless mode exits non-zero on retired slugs). If ChatGPT.app is installed, its bundled `codex` is preferred over a global npm install, because an npm install doesn't update itself and older clients get refused for current models.
 
 Local activity is read from:
 
 ```text
 ~/.claude/projects/*/*.jsonl
 ~/.codex/sessions/YYYY/MM/DD/*.jsonl
+~/.gemini/antigravity-cli/conversations/*.db
+~/.gemini/antigravity/conversations/*.db
 ```
 
 These logs both give the UI display context and, since they reflect real usage rather than a network call, back up the auto-warm decision when the live API can't.
@@ -64,8 +68,9 @@ These logs both give the UI display context and, since they reflect real usage r
 | --- | --- |
 | macOS | 14.0 Sonoma or later |
 | Xcode | 16+ (local builds only — see below) |
-| Claude Code | Installed and available on your shell `PATH` |
-| Codex CLI | Installed and available on your shell `PATH` |
+| Claude Code | Optional — install on `PATH` if enabled |
+| Codex CLI | Optional — install on `PATH` if enabled |
+| Antigravity (`agy`) | Optional — Antigravity app or `agy` CLI (1.1.11+) if enabled |
 
 ## Install
 

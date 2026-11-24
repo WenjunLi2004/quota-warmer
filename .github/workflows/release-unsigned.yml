@@ -29,7 +29,7 @@ env:
 jobs:
   release:
     name: Ad-hoc signed DMG
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 30
 
     steps:
@@ -42,7 +42,9 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.3.app
 
       - name: Install XcodeGen
-        run: brew install xcodegen
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
 
       - name: Determine release version
         id: version
@@ -64,6 +66,7 @@ jobs:
           fi
 
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "base_version=${VERSION%%-*}" >> "${GITHUB_OUTPUT}"
           echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
 
       - name: Validate project version
@@ -71,8 +74,10 @@ jobs:
         run: |
           set -euo pipefail
           PROJECT_VERSION=$(awk -F'"' '/CFBundleShortVersionString:/ { print $2; exit }' project.yml)
-          if [[ "${PROJECT_VERSION}" != "${{ steps.version.outputs.version }}" ]]; then
-            echo "project.yml CFBundleShortVersionString (${PROJECT_VERSION}) does not match tag version (${{ steps.version.outputs.version }})."
+          TAG_VERSION="${{ steps.version.outputs.version }}"
+          BASE_VERSION="${TAG_VERSION%%-*}"
+          if [[ "${PROJECT_VERSION}" != "${TAG_VERSION}" && "${PROJECT_VERSION}" != "${BASE_VERSION}" ]]; then
+            echo "project.yml CFBundleShortVersionString (${PROJECT_VERSION}) does not match tag version (${TAG_VERSION})."
             exit 1
           fi
 
@@ -89,7 +94,9 @@ jobs:
             -configuration Release \
             -derivedDataPath DerivedData \
             -destination "generic/platform=macOS" \
-            MARKETING_VERSION="${{ steps.version.outputs.version }}" \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            MARKETING_VERSION="${{ steps.version.outputs.base_version }}" \
             CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
@@ -106,6 +113,7 @@ jobs:
             echo "Could not locate built app."
             exit 1
           fi
+          lipo -info "${APP_PATH}/Contents/MacOS/${APP_NAME}"
           # Ad-hoc signature ("-") so the app launches on Apple Silicon after download.
           codesign --force --deep --sign - "${APP_PATH}"
           codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
@@ -163,7 +171,7 @@ jobs:
           cat > RELEASE_NOTES.md <<EOF
           ## QuotaWarmer ${{ steps.version.outputs.version }}
 
-          macOS menu bar app for starting Claude Code and Codex quota windows with minimal warmup messages.
+          macOS menu bar app for starting Claude Code, Codex, and Antigravity quota windows with minimal warmup messages, with per-provider Turn Off / Turn On controls.
 
           > This build is **ad-hoc signed but not Apple-notarized**. macOS Gatekeeper
           > will warn on first launch. Clear quarantine once after installing:

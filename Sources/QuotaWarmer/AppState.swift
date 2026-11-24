@@ -15,19 +15,32 @@ struct WarmupLog: Identifiable {
 final class ToolState: ObservableObject {
     let tool: ToolID
 
+    /// Master enable switch for this provider. When `false`, the provider is
+    /// completely turned off: hidden from the menu bar, sidebar, and overview,
+    /// with all background polling, notifications, and warmups stopped until
+    /// turned back on.
+    @Published var isEnabled: Bool {
+        didSet { ToolEnablementPolicy.setEnabled(isEnabled, for: tool) }
+    }
+
     /// Source of truth for how this tool is treated. `.monitor` is the safe
     /// default; `.autoWarm` is an explicit opt-in. See `ToolMode`.
     @Published var mode: ToolMode {
         didSet { UserDefaults.standard.set(mode.rawValue, forKey: "toolMode.\(tool.rawValue)") }
     }
 
-    /// Whether QuotaWarmer polls quota for this tool (monitor or auto-warm).
-    var isMonitored: Bool { mode != .off }
+    /// Whether QuotaWarmer polls quota for this tool (enabled + monitor or auto-warm).
+    var isMonitored: Bool {
+        ToolEnablementPolicy.effectiveMonitored(isEnabled: isEnabled, mode: mode)
+    }
     /// Whether automatic warm-up may fire for this tool.
-    var isAutoWarmEnabled: Bool { mode == .autoWarm }
+    var isAutoWarmEnabled: Bool {
+        ToolEnablementPolicy.effectiveAutoWarm(isEnabled: isEnabled, mode: mode)
+    }
 
     /// Whether this tool's glyph + quota is pinned to the menu bar. Independent
-    /// of `mode` — an off/monitor tool can still be watched in the menu bar.
+    /// of `mode` — an off/monitor tool can still be watched in the menu bar
+    /// while enabled; turning the provider off hides it until re-enabled.
     @Published var menuBarVisible: Bool {
         didSet { UserDefaults.standard.set(menuBarVisible, forKey: "menuBarVisible.\(tool.rawValue)") }
     }
@@ -48,6 +61,9 @@ final class ToolState: ObservableObject {
     @Published var authRetryScheduledAt: Date?
     @Published var confirmedWarmupResetAt: Date?
     @Published var lastAutoWindowKey: String?
+    var lastLowQuotaAlertKey: String? {
+        didSet { UserDefaults.standard.set(lastLowQuotaAlertKey, forKey: "lastLowQuotaAlertKey.\(tool.rawValue)") }
+    }
     /// When the window we last auto-warmed will reset. Until then, the auto path
     /// won't warm again — a dedup that survives providers whose reported reset
     /// time drifts between polls (e.g. Codex `reset_after_seconds`).
@@ -63,9 +79,11 @@ final class ToolState: ObservableObject {
 
     init(tool: ToolID) {
         self.tool = tool
+        self.isEnabled = ToolEnablementPolicy.isEnabled(for: tool)
         self.mode = ToolState.resolveMode(for: tool)
         self.menuBarVisible = UserDefaults.standard.object(forKey: "menuBarVisible.\(tool.rawValue)") as? Bool ?? true
         self.lastAutoWindowKey = UserDefaults.standard.string(forKey: "lastAutoWindowKey.\(tool.rawValue)")
+        self.lastLowQuotaAlertKey = UserDefaults.standard.string(forKey: "lastLowQuotaAlertKey.\(tool.rawValue)")
         if let storedEnds = UserDefaults.standard.object(forKey: "lastAutoWarmEndsAt.\(tool.rawValue)") as? TimeInterval {
             let endsAt = Date(timeIntervalSince1970: storedEnds)
             if endsAt > Date() {
@@ -299,6 +317,78 @@ final class AppState: ObservableObject {
 
     func state(for tool: ToolID) -> ToolState { toolStates[tool]! }
 
+    /// Providers currently turned on by the user, preserving `ToolID.allCases` order.
+    var enabledTools: [ToolID] {
+        ToolID.allCases.filter { state(for: $0).isEnabled }
+    }
+
+    /// Providers currently turned off by the user.
+    var disabledTools: [ToolID] {
+        ToolID.allCases.filter { !state(for: $0).isEnabled }
+    }
+
+    /// Aggregated today token usage across all enabled providers for the Overview card.
+    var todayTokensSummary: TodayTokenTotalizer.Summary {
+        var summaries: [ToolID: TokenUsageSummary] = [:]
+        for tool in enabledTools {
+            if let summary = state(for: tool).tokenUsageSummary {
+                summaries[tool] = summary
+            }
+        }
+        return TodayTokenTotalizer.summarize(enabledTools: enabledTools, summaries: summaries)
+    }
+
+    /// Actively turns an entire provider on or off. Turning off stops all
+    /// timers, notifications, credential reads, and warmups and hides the
+    /// provider from the menu bar, sidebar, and overview; turning it back on
+    /// restores its mode (resuming `.monitor` if it was `.off`) and refreshes.
+    func setToolEnabled(_ enabled: Bool, for tool: ToolID) {
+        let state = state(for: tool)
+        guard state.isEnabled != enabled else { return }
+        objectWillChange.send()
+        state.isEnabled = enabled
+
+        if enabled {
+            let restored = ToolEnablementPolicy.restoredModeOnEnable(currentMode: state.mode)
+            if state.mode != restored {
+                state.mode = restored
+            }
+            state.lastLogActivity = scanner.lastActivity(for: tool)
+            state.weeklyActivity = scanner.weeklyActivity(for: tool)
+            addHistory(
+                tool: tool,
+                kind: .quotaFetch,
+                title: "Provider enabled",
+                detail: "\(tool.displayName) turned on (\(state.mode.label))"
+            )
+            if state.isMonitored {
+                Task { await refreshQuota(for: tool, allowAutomaticWarmup: state.isAutoWarmEnabled && !globalPassive) }
+            } else {
+                refreshTokenUsage(for: tool)
+            }
+            Task { await checkOnboarding() }
+        } else {
+            scheduler.invalidate(tool: tool)
+            notifications.cancelAll(for: tool)
+            state.claimVerifyTask?.cancel(); state.claimVerifyTask = nil
+            state.settleRepollTask?.cancel(); state.settleRepollTask = nil
+            clearAuthRetry(for: state)
+            state.nextRefreshAt = nil
+            state.isFetchingQuota = false
+            state.errorMessage = nil
+            if selectedTab == .tool(tool) {
+                selectedTab = .main
+            }
+            addHistory(
+                tool: tool,
+                kind: .quotaFetch,
+                title: "Provider disabled",
+                detail: "\(tool.displayName) turned off — turn back on anytime"
+            )
+            Task { await checkOnboarding() }
+        }
+    }
+
     /// Pins/unpins a tool in the menu bar. Routed through AppState so the
     /// menu-bar label (which observes AppState, not each ToolState) refreshes
     /// immediately when toggled.
@@ -358,7 +448,13 @@ final class AppState: ObservableObject {
 
     func refreshAllActivity(allowAutomaticWarmup: Bool = false, includeInactive: Bool = false) {
         isRefreshing = true
-        let tools = ToolID.allCases.filter { includeInactive || state(for: $0).isMonitored }
+        for tool in enabledTools {
+            refreshTokenUsage(for: tool)
+        }
+        let tools = ToolID.allCases.filter {
+            let st = state(for: $0)
+            return st.isEnabled && (includeInactive || st.isMonitored)
+        }
         guard !tools.isEmpty else {
             isRefreshing = false
             return
@@ -398,10 +494,12 @@ final class AppState: ObservableObject {
         force: Bool = false
     ) async {
         let state = state(for: tool)
+        guard state.isEnabled else { return }
         // Timer, wake and scheduler callbacks can converge on the same instant.
         // Claude refresh tokens are single-use, so only one Claude request chain
         // may run at a time. Codex keeps its existing behavior unchanged.
         guard tool != .claude || !state.isFetchingQuota else { return }
+        guard tool != .antigravity || !state.isFetchingQuota else { return }
         refreshTokenUsage(for: tool)
         if let backoffUntil = state.quotaBackoffUntil, backoffUntil > Date() {
             // An explicit user request retries now. Clearing the backoff matters
@@ -445,6 +543,17 @@ final class AppState: ObservableObject {
             )
             rescheduleRefresh(for: tool)
 
+            if let alertKey = LowQuotaAlertPolicy.shouldAlert(
+                enabled: notifyLowQuota,
+                snapshot: snapshot,
+                windowDuration: tool.windowDuration,
+                lastAlertedKey: state.lastLowQuotaAlertKey
+            ), let metric = snapshot.fiveHour {
+                state.lastLowQuotaAlertKey = alertKey
+                let pct = Int((metric.remainingFraction * 100).rounded())
+                notifications.notifyLowQuota(tool: tool, remainingPercent: pct, resetAt: metric.resetAt)
+            }
+
             // A successful OAuth quota response is stronger evidence than the
             // headless `claude auth status` probe, which can report logged-out
             // even while the real Claude CLI and OAuth credential are usable.
@@ -454,6 +563,7 @@ final class AppState: ObservableObject {
                 // the warm-up path performs its post-command verification fetch;
                 // otherwise the single-flight guard would discard that proof.
                 if tool == .claude { state.isFetchingQuota = false }
+                if tool == .antigravity { state.isFetchingQuota = false }
                 await attemptAutomaticWarmup(tool: tool, reason: "fresh quota")
             }
         } catch {
@@ -521,15 +631,14 @@ final class AppState: ObservableObject {
         // refresh cycles can pile up overlapping disk scans.
         guard !state.isFetchingTokenUsage else { return }
         state.isFetchingTokenUsage = true
-        // The scan walks thousands of CLI JSONL log files synchronously; keep it
-        // off the main actor so the menu-bar panel never freezes (which also kept
-        // it from dismissing on outside clicks). A fresh provider per call avoids
-        // sharing the non-thread-safe date formatters across concurrent scans.
-        Task.detached(priority: .utility) {
-            let summary = LocalUsageProvider().usage(for: tool)
+        // Keep remote analytics + local JSONL log reconciliation off the main
+        // actor so the menu-bar panel never freezes.
+        Task.detached(priority: .utility) { [weak self] in
+            let summary = await LocalUsageProvider().usageAsync(for: tool)
             await MainActor.run {
                 state.tokenUsageSummary = summary
                 state.isFetchingTokenUsage = false
+                self?.objectWillChange.send()
             }
         }
     }
@@ -538,7 +647,25 @@ final class AppState: ObservableObject {
         startQuotaRefreshTimer()
         startUIRefreshTimer()
         for tool in ToolID.allCases where state(for: tool).isMonitored {
-            state(for: tool).nextRefreshAt = Date().addingTimeInterval(refreshInterval)
+            rescheduleRefresh(for: tool)
+        }
+    }
+
+    func applyMenuBarDisplayStyle() {
+        objectWillChange.send()
+    }
+
+    func applyActiveHours() {
+        objectWillChange.send()
+        for tool in ToolID.allCases where state(for: tool).isMonitored {
+            rescheduleRefresh(for: tool)
+        }
+        if ActiveHoursPolicy.isWithinActiveHours(
+            enabled: activeHoursEnabled,
+            startHour: activeHoursStart,
+            endHour: activeHoursEnd
+        ) {
+            refreshAllActivity(allowAutomaticWarmup: true)
         }
     }
 
@@ -658,7 +785,7 @@ final class AppState: ObservableObject {
             )
 
             guard case .run(let caughtUp) = decision else { continue }
-            guard canAttemptManagedWarmup(for: tool) else { continue }
+            guard canAttemptManagedWarmup(for: tool, ignoreActiveHours: true) else { continue }
 
             let previousQuotaFetchedAt = state(for: tool).quotaSnapshot?.fetchedAt
             let succeeded = await triggerWarmup(
@@ -791,10 +918,18 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func canAttemptManagedWarmup(for tool: ToolID) -> Bool {
+    private func canAttemptManagedWarmup(for tool: ToolID, ignoreActiveHours: Bool = false) -> Bool {
         let state = state(for: tool)
         guard state.isAutoWarmEnabled, !globalPassive, !state.isWarming else { return false }
         guard state.authStatus != .failed, state.authStatus != .missing else { return false }
+        if !ignoreActiveHours,
+           !ActiveHoursPolicy.isWithinActiveHours(
+               enabled: activeHoursEnabled,
+               startHour: activeHoursStart,
+               endHour: activeHoursEnd
+           ) {
+            return false
+        }
         if UserDefaults.standard.object(forKey: "rateLimitGuard") as? Bool ?? true,
            let backoffUntil = state.backoffUntil,
            backoffUntil > Date() {
@@ -826,7 +961,7 @@ final class AppState: ObservableObject {
     @discardableResult
     private func triggerWarmup(tool: ToolID, mode: String) async -> Bool {
         let state = state(for: tool)
-        guard !state.isWarming else { return false }
+        guard state.isEnabled, !state.isWarming else { return false }
 
         state.isWarming = true
         state.errorMessage = nil
@@ -1264,14 +1399,30 @@ final class AppState: ObservableObject {
             state.nextRefreshAt = nil
             return
         }
-        let nextDate = Date().addingTimeInterval(refreshInterval)
+        let now = Date()
+        var nextDate = SmartRefreshPolicy.nextRefreshDate(
+            now: now,
+            refreshInterval: refreshInterval,
+            windowResetAt: state.realWindowResetAt
+        )
+        if activeHoursEnabled,
+           state.isAutoWarmEnabled,
+           !ActiveHoursPolicy.isWithinActiveHours(
+               now: now,
+               enabled: true,
+               startHour: activeHoursStart,
+               endHour: activeHoursEnd
+           ),
+           let activeStart = ActiveHoursPolicy.nextActiveStart(after: now, startHour: activeHoursStart) {
+            nextDate = min(nextDate, activeStart)
+        }
         scheduler.schedule(tool: tool, at: nextDate)
         state.nextRefreshAt = nextDate
         // Use the *real* window reset, not the idle "if you started now"
         // projection that `resetAt` falls back to — otherwise an idle window
         // (e.g. Claude's null `five_hour`) would schedule a misleading
         // "window expiring soon" notification for a window that never opened.
-        if let resetAt = state.realWindowResetAt, resetAt > Date() {
+        if let resetAt = state.realWindowResetAt, resetAt > now {
             notifications.scheduleWindowWarning(for: tool, expiresAt: resetAt)
         }
     }
@@ -1305,6 +1456,26 @@ final class AppState: ObservableObject {
         return TimeInterval(stored.nonZero ?? 300)
     }
 
+    var menuBarDisplayStyle: MenuBarDisplayStyle {
+        MenuBarDisplayStyle.resolve(rawValue: UserDefaults.standard.string(forKey: "menuBarDisplayStyle"))
+    }
+
+    var activeHoursEnabled: Bool {
+        UserDefaults.standard.object(forKey: "activeHoursEnabled") as? Bool ?? false
+    }
+
+    var activeHoursStart: Int {
+        UserDefaults.standard.object(forKey: "activeHoursStart") as? Int ?? 8
+    }
+
+    var activeHoursEnd: Int {
+        UserDefaults.standard.object(forKey: "activeHoursEnd") as? Int ?? 23
+    }
+
+    var notifyLowQuota: Bool {
+        UserDefaults.standard.object(forKey: "notifyLowQuota") as? Bool ?? true
+    }
+
     private func addHistory(tool: ToolID?, kind: HistoryKind, title: String, detail: String) {
         let event = HistoryEvent(timestamp: Date(), tool: tool, kind: kind, title: title, detail: detail)
         history.insert(event, at: 0)
@@ -1321,10 +1492,12 @@ final class AppState: ObservableObject {
 
     private func checkOnboarding() async {
         var anyMissing = false
-        for tool in ToolID.allCases {
+        for tool in enabledTools {
             if await runner.cliMissing(tool) { anyMissing = true }
         }
-        if anyMissing && !UserDefaults.standard.bool(forKey: "onboardingDismissed") {
+        if !anyMissing {
+            showOnboarding = false
+        } else if !UserDefaults.standard.bool(forKey: "onboardingDismissed") {
             showOnboarding = true
         }
     }

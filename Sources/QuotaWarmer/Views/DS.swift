@@ -51,9 +51,11 @@ enum DS {
 
         /// Per-tool brand accent. Kept as-is to preserve product identity.
         static func accent(_ tool: ToolID) -> Color {
-            tool == .claude
-                ? Color(red: 0.90, green: 0.38, blue: 0.05)   // Anthropic orange
-                : Color(red: 0.38, green: 0.24, blue: 0.90)   // OpenAI indigo
+            switch tool {
+            case .claude:      return Color(red: 0.90, green: 0.38, blue: 0.05)   // Anthropic orange
+            case .codex:       return Color(red: 0.38, green: 0.24, blue: 0.90)   // OpenAI indigo
+            case .antigravity: return Color(red: 0.19, green: 0.53, blue: 1.00)   // Antigravity blue
+            }
         }
     }
 

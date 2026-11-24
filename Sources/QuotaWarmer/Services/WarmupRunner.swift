@@ -1,5 +1,12 @@
 import Foundation
+#if canImport(CFNetwork)
 import CFNetwork
+#endif
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 enum WarmupError: LocalizedError {
     case cliNotFound(String)
@@ -57,25 +64,35 @@ struct ClaudeCLIAuthSnapshot {
 
 class WarmupRunner {
     static let claudeLoginRequiredMessage = "Claude Code is not logged in. Run `claude auth login` in Terminal, then retry warmup."
+    static let antigravityLoginRequiredMessage = "Antigravity CLI is not signed in. Run `agy` in Terminal to sign in, then retry warmup."
 
     func warmup(_ tool: ToolID) async throws -> WarmupResult {
-        let cliName = tool == .claude ? "claude" : "codex"
+        let cliName = tool.cliExecutableName
         guard let cliURL = await resolveCLI(named: cliName) else {
             throw WarmupError.cliNotFound(cliName)
         }
         let pathPrefix = cliURL.deletingLastPathComponent().path
 
         let workspaceURL = try warmupWorkspaceURL()
+        let primaryCommand = Self.substitutingResolvedBinary(tool.warmupCommand, cliName: cliName, resolvedPath: cliURL.path)
         do {
-            return try await runWarmupCommand(tool.warmupCommand, cliName: cliName, pathPrefix: pathPrefix, workspaceURL: workspaceURL)
+            return try await runWarmupCommand(primaryCommand, cliName: cliName, pathPrefix: pathPrefix, workspaceURL: workspaceURL)
         } catch WarmupError.exitCode where tool.fallbackWarmupCommand != nil {
-            let result = try await runWarmupCommand(tool.fallbackWarmupCommand!, cliName: cliName, pathPrefix: pathPrefix, workspaceURL: workspaceURL)
+            let fallbackCommand = Self.substitutingResolvedBinary(tool.fallbackWarmupCommand!, cliName: cliName, resolvedPath: cliURL.path)
+            let result = try await runWarmupCommand(fallbackCommand, cliName: cliName, pathPrefix: pathPrefix, workspaceURL: workspaceURL)
             return WarmupResult(
                 date: result.date,
                 command: result.command,
                 output: "Primary warmup command failed; retried with the configured fallback command.\n\(result.output)"
             )
         }
+    }
+
+    private static func substitutingResolvedBinary(_ command: String, cliName: String, resolvedPath: String) -> String {
+        let prefix = "\(cliName) "
+        guard command.hasPrefix(prefix) else { return command }
+        let quoted = "'" + resolvedPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        return quoted + " " + command.dropFirst(prefix.count)
     }
 
     func cliAuthenticationStatus(for tool: ToolID) async -> CLIAuthenticationStatus {
@@ -89,10 +106,10 @@ class WarmupRunner {
     private func runWarmupCommand(_ command: String, cliName: String, pathPrefix: String, workspaceURL: URL) async throws -> WarmupResult {
         return try await withCheckedThrowingContinuation { continuation in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.executableURL = Self.shellExecutableURL()
             process.arguments = ["-lc", command]
             process.currentDirectoryURL = workspaceURL
-            process.environment = environment(prependingPath: pathPrefix)
+            process.environment = environment(prependingPath: pathPrefix, cliName: cliName)
             // The CLI (e.g. `codex exec`) reads stdin when it is not a tty and a
             // prompt is also provided. A GUI agent app inherits an arbitrary
             // stdin that can block forever, turning a fast warm-up into a 60s
@@ -134,6 +151,8 @@ class WarmupRunner {
                     continuation.resume(returning: WarmupResult(date: Date(), command: command, output: combined.isEmpty ? "(no output)" : combined))
                 } else if cliName == "claude", Self.isClaudeAuthenticationFailure(combined) {
                     continuation.resume(throwing: WarmupError.authenticationRequired(Self.claudeLoginRequiredMessage))
+                } else if cliName == "agy", Self.isAntigravityAuthenticationFailure(combined) {
+                    continuation.resume(throwing: WarmupError.authenticationRequired(Self.antigravityLoginRequiredMessage))
                 } else {
                     continuation.resume(throwing: WarmupError.exitCode(p.terminationStatus))
                 }
@@ -152,8 +171,24 @@ class WarmupRunner {
     }
 
     func cliMissing(_ tool: ToolID) async -> Bool {
-        let name = tool == .claude ? "claude" : "codex"
+        let name = tool.cliExecutableName
+        if tool == .antigravity {
+            if await resolveCLI(named: name) != nil { return false }
+            // Antigravity Desktop / IDE app can also supply live quota locally.
+            let appCandidates = [
+                "/Applications/Antigravity.app",
+                "\(FileManager.default.homeDirectoryForCurrentUser.path)/Applications/Antigravity.app"
+            ]
+            if appCandidates.contains(where: { FileManager.default.fileExists(atPath: $0) }) {
+                return false
+            }
+            return true
+        }
         return await resolveCLI(named: name) == nil
+    }
+
+    func resolveCLIURL(for tool: ToolID) async -> URL? {
+        await resolveCLI(named: tool.cliExecutableName)
     }
 
     private func claudeAuthenticationStatus(pathPrefix: String) async -> CLIAuthenticationStatus {
@@ -181,16 +216,102 @@ class WarmupRunner {
         return .authenticated(nil)
     }
 
-    private static func isClaudeAuthenticationFailure(_ output: String) -> Bool {
+    static func isClaudeAuthenticationFailure(_ output: String) -> Bool {
         let text = output.lowercased()
         return text.contains("not logged in")
             || text.contains("please run /login")
             || text.contains("run claude auth login")
     }
 
+    static func isAntigravityAuthenticationFailure(_ output: String) -> Bool {
+        let text = output.lowercased()
+        return text.contains("not logged in")
+            || text.contains("not signed in")
+            || text.contains("unauthenticated")
+            || text.contains("authentication required")
+            || text.contains("login required")
+            || text.contains("please log in")
+            || text.contains("please sign in")
+            || text.contains("select login method")
+            || text.contains("keyring auth: timed out")
+    }
+
+    struct DirectCommandResult {
+        let exitCode: Int32
+        let stdout: String
+        let stderr: String
+        let timedOut: Bool
+    }
+
     private struct ShellCommandResult {
         let exitCode: Int32
         let output: String
+    }
+
+    private static func shellExecutableURL() -> URL {
+        if FileManager.default.isExecutableFile(atPath: "/bin/zsh") {
+            return URL(fileURLWithPath: "/bin/zsh")
+        }
+        return URL(fileURLWithPath: "/bin/bash")
+    }
+
+    func runDirectCommand(
+        executableURL: URL,
+        arguments: [String],
+        extraEnvironment: [String: String] = [:],
+        pathPrefix: String? = nil,
+        cliName: String? = nil,
+        currentDirectoryURL: URL? = nil,
+        timeout: TimeInterval
+    ) async -> DirectCommandResult {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = executableURL
+            process.arguments = arguments
+            process.currentDirectoryURL = currentDirectoryURL
+            var env = environment(prependingPath: pathPrefix, cliName: cliName)
+            for (k, v) in extraEnvironment { env[k] = v }
+            process.environment = env
+            process.standardInput = FileHandle.nullDevice
+
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+            let outCollector = SinglePipeCollector(pipe: outPipe)
+            let errCollector = SinglePipeCollector(pipe: errPipe)
+
+            let gate = WarmupContinuationGate()
+            let timeoutWork = DispatchWorkItem {
+                process.terminate()
+                if gate.tryResume() {
+                    let stdout = outCollector.stop()
+                    let stderr = errCollector.stop()
+                    continuation.resume(returning: DirectCommandResult(exitCode: -1, stdout: stdout, stderr: stderr, timedOut: true))
+                }
+            }
+
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
+
+            process.terminationHandler = { p in
+                timeoutWork.cancel()
+                guard gate.tryResume() else { return }
+                let stdout = outCollector.stop()
+                let stderr = errCollector.stop()
+                continuation.resume(returning: DirectCommandResult(exitCode: p.terminationStatus, stdout: stdout, stderr: stderr, timedOut: false))
+            }
+
+            do {
+                try process.run()
+            } catch {
+                timeoutWork.cancel()
+                if gate.tryResume() {
+                    _ = outCollector.stop()
+                    _ = errCollector.stop()
+                    continuation.resume(returning: DirectCommandResult(exitCode: -1, stdout: "", stderr: error.localizedDescription, timedOut: false))
+                }
+            }
+        }
     }
 
     private func runShellCommand(
@@ -201,7 +322,7 @@ class WarmupRunner {
     ) async -> ShellCommandResult {
         await withCheckedContinuation { continuation in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.executableURL = Self.shellExecutableURL()
             process.arguments = ["-lc", command]
             process.currentDirectoryURL = currentDirectoryURL
             process.environment = environment(prependingPath: pathPrefix)
@@ -246,6 +367,17 @@ class WarmupRunner {
     }
 
     private func resolveCLI(named name: String) async -> URL? {
+        let agyOverride = getenv("ANTIGRAVITY_CLI_PATH").map { String(cString: $0) }
+            ?? ProcessInfo.processInfo.environment["ANTIGRAVITY_CLI_PATH"]
+        if name == "agy", let override = agyOverride {
+            let trimmed = override.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed.hasPrefix("/"),
+                  FileManager.default.isExecutableFile(atPath: trimmed) else {
+                return nil
+            }
+            return URL(fileURLWithPath: trimmed)
+        }
+
         for url in candidateCLIURLs(named: name) {
             if FileManager.default.isExecutableFile(atPath: url.path) {
                 return url
@@ -262,7 +394,7 @@ class WarmupRunner {
     private func commandPath(named name: String) async -> URL? {
         await withCheckedContinuation { continuation in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.executableURL = Self.shellExecutableURL()
             process.arguments = ["-lc", "command -v \(name)"]
             process.environment = environment(prependingPath: nil)
 
@@ -291,7 +423,7 @@ class WarmupRunner {
         }
     }
 
-    private func candidateCLIURLs(named name: String) -> [URL] {
+    func candidateCLIURLs(named name: String) -> [URL] {
         let fileManager = FileManager.default
         let home = fileManager.homeDirectoryForCurrentUser
         var dirs: [URL] = []
@@ -303,6 +435,20 @@ class WarmupRunner {
             // model, including the user's configured default, while the bundled
             // 0.162 warmed fine. This copy moves with each ChatGPT.app update.
             dirs.append(URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin"))
+        }
+        if name == "agy" {
+            dirs += [
+                home.appendingPathComponent(".antigravity/antigravity/bin"),
+                home.appendingPathComponent(".local/bin"),
+                URL(fileURLWithPath: "/opt/homebrew/bin"),
+                URL(fileURLWithPath: "/usr/local/bin"),
+                URL(fileURLWithPath: "/Applications/Antigravity.app/Contents/Resources/app/bin"),
+                URL(fileURLWithPath: "/Applications/Antigravity.app/Contents/Helpers"),
+                home.appendingPathComponent("Applications/Antigravity.app/Contents/Resources/app/bin"),
+                home.appendingPathComponent("Applications/Antigravity.app/Contents/Helpers"),
+                URL(fileURLWithPath: "/Applications/Gemini.app/Contents/Helpers"),
+                home.appendingPathComponent("Applications/Gemini.app/Contents/Helpers")
+            ]
         }
         dirs += [
             URL(fileURLWithPath: "/opt/homebrew/bin"),
@@ -334,7 +480,7 @@ class WarmupRunner {
         }
     }
 
-    private func environment(prependingPath pathPrefix: String?) -> [String: String] {
+    func environment(prependingPath pathPrefix: String?, cliName: String? = nil) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         var components: [String] = []
         if let pathPrefix, !pathPrefix.isEmpty {
@@ -344,6 +490,7 @@ class WarmupRunner {
             "/opt/homebrew/bin",
             "/opt/homebrew/sbin",
             "/usr/local/bin",
+            "\(FileManager.default.homeDirectoryForCurrentUser.path)/.antigravity/antigravity/bin",
             "\(FileManager.default.homeDirectoryForCurrentUser.path)/.local/bin",
             "\(FileManager.default.homeDirectoryForCurrentUser.path)/.bun/bin"
         ])
@@ -351,6 +498,13 @@ class WarmupRunner {
             components.append(existing)
         }
         env["PATH"] = uniquePath(components).joined(separator: ":")
+
+        if cliName == "agy" {
+            // agy ignores "1"; "true" suppresses in-flight background self-updates,
+            // and a no-op BROWSER stops a signed-out run from launching Safari/Chrome.
+            env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
+            env["BROWSER"] = "/usr/bin/false"
+        }
 
         // QuotaWarmer is launched by launchd, not a login shell, so it never
         // sees a proxy that's only exported from .zshrc — and `zsh -lc` (login
@@ -370,7 +524,8 @@ class WarmupRunner {
     /// HTTP(S)_PROXY derived from macOS's system proxy settings (System
     /// Settings > Network > Proxies, or whatever a proxy app like Clash wrote
     /// there in "system proxy" mode). Empty when no such proxy is enabled.
-    private static func systemProxyEnvironment() -> [String: String] {
+    static func systemProxyEnvironment() -> [String: String] {
+        #if canImport(CFNetwork) && os(macOS)
         guard let settings = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
             return [:]
         }
@@ -388,6 +543,9 @@ class WarmupRunner {
             result["HTTPS_PROXY"] = "http://\(host):\(port)"
         }
         return result
+        #else
+        return [:]
+        #endif
     }
 
     private func uniquePath(_ components: [String]) -> [String] {
@@ -502,7 +660,7 @@ private final class ProcessOutputCollector: @unchecked Sendable {
     /// Reads everything currently buffered on `handle` without blocking: flips the
     /// descriptor to non-blocking and reads until `EAGAIN`/EOF. A lingering child
     /// holding the write end yields `EAGAIN` (no data) rather than hanging.
-    private static func drainNonBlocking(_ handle: FileHandle) -> Data {
+    fileprivate static func drainNonBlocking(_ handle: FileHandle) -> Data {
         let fd = handle.fileDescriptor
         guard fd >= 0 else { return Data() }
         let flags = fcntl(fd, F_GETFL)
@@ -519,5 +677,45 @@ private final class ProcessOutputCollector: @unchecked Sendable {
             }
         }
         return collected
+    }
+}
+
+/// Separate single-descriptor non-blocking collector used when stdout holds
+/// structured JSON (e.g. `agy -p /usage --output-format json`) that must not be
+/// interleaved with diagnostic stderr.
+private final class SinglePipeCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var stopped = false
+    private let handle: FileHandle
+
+    init(pipe: Pipe) {
+        handle = pipe.fileHandleForReading
+        handle.readabilityHandler = { [weak self] h in
+            guard let self else { h.readabilityHandler = nil; return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            if self.stopped { h.readabilityHandler = nil; return }
+            let data = h.availableData
+            if data.isEmpty {
+                h.readabilityHandler = nil
+            } else {
+                self.buffer.append(data)
+            }
+        }
+    }
+
+    @discardableResult
+    func stop() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        if !stopped {
+            stopped = true
+            handle.readabilityHandler = nil
+            let tail = ProcessOutputCollector.drainNonBlocking(handle)
+            if !tail.isEmpty { buffer.append(tail) }
+        }
+        return (String(data: buffer, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

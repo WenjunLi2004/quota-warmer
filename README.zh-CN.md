@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-一个小巧的 macOS 菜单栏应用,帮你把 Claude Code 和 Codex CLI 的 5 小时配额窗口一直"焐热"——它盯着你的滚动配额窗口,窗口一开就自动接手续上,不用你自己记着去用一下才能触发。
+一个小巧的 macOS 菜单栏应用,帮你把 Claude Code、Codex CLI 和 Antigravity 的 5 小时配额窗口一直"焐热"——它盯着你的滚动配额窗口,窗口一开就自动接手续上,不用你自己记着去用一下才能触发。
 
 <p align="center">
   <img src="docs/images/panel-overview-light.png" alt="QuotaWarmer 总览面板,浅色" width="360">
@@ -12,17 +12,18 @@
   <img src="docs/images/menu-bar.png" alt="QuotaWarmer 菜单栏显示" height="20">
 </p>
 
-默认只**监控**:实时看配额、在菜单栏显示每个工具的窗口状态。把某个工具切到 **Auto-warm**,它就会在窗口一开的瞬间,通过你本机已登录的 CLI 发一条最小化的预热命令,然后再确认一遍窗口是不是真的开了。
+默认只**监控**:实时看配额、在菜单栏显示每个工具的窗口状态。把某个工具切到 **Auto-warm**,它就会在窗口一开的瞬间,通过你本机已登录的 CLI 发一条最小化的预热命令,然后再确认一遍窗口是不是真的开了。暂时不用的工具(例如 Claude Code)可以随时主动一键关闭,需要时再一键重新打开。
 
 ## 关于这个仓库
 
-这是 [bcanozgur/quota-warmer](https://github.com/bcanozgur/quota-warmer) 的个人 fork。保留它的原因是上游唯一发布过的正式版本带一个凭据相关的 bug(见下方[鸣谢](#鸣谢)),我需要一个不带这个 bug 的版本用在自己每天的自动化上——一台 Mac 早上 7 点自动醒来,把两个工具都预热好,然后全天自动续窗口,不用我插手。在这个基础上,我把面板重做成跟随系统浅色/深色外观(而不是写死的十六进制颜色)、修掉了反复弹出的钥匙串授权框,还让自动续窗口这件事在配额查询接口被限流时也能扛得住——查下来发现这个接口真的会一连限流好几个小时,之前一限流,整个自动续期就跟着停摆。
+这是 [bcanozgur/quota-warmer](https://github.com/bcanozgur/quota-warmer) 的个人 fork。保留它的原因是上游唯一发布过的正式版本带一个凭据相关的 bug(见下方[鸣谢](#鸣谢)),我需要一个不带这个 bug 的版本用在自己每天的自动化上——一台 Mac 早上 7 点自动醒来,把在用的工具都预热好,然后全天自动续窗口,不用我插手。在这个基础上,我把面板重做成跟随系统浅色/深色外观(而不是写死的十六进制颜色)、修掉了反复弹出的钥匙串授权框、加入了 Google Antigravity 支持与每个工具的独立总开关,还让自动续窗口这件事在配额查询接口被限流时也能扛得住——查下来发现这个接口真的会一连限流好几个小时,之前一限流,整个自动续期就跟着停摆。
 
 ## 亮点
 
-- **每个工具三档模式**:**Off**(关闭)、**Monitor only**(只看不发,默认档)、**Auto-warm**(自动抢开新窗口)。
+- **每个工具独立总开关**:暂时不用的工具(如 Claude)可在总览卡片右上角电源按钮、工具详情页、Settings → Providers 或菜单栏右键菜单中一键关闭(从菜单栏、侧边栏和总览隐藏并彻底停止轮询/预热),需要时一键重新打开。
+- **已启用工具三档模式**:**Off**(暂停监控)、**Monitor only**(只看不发,默认档)、**Auto-warm**(自动抢开新窗口)。
 - **菜单栏一眼看懂状态**:工具图标、时钟式倒计时、剩余配额百分比——健康时安安静静,只有真需要注意时才会亮起彩色角标。
-- **同时支持 Claude Code 和 Codex CLI**:两个工具各自独立监控、刷新、预热。
+- **同时支持 Claude Code、Codex CLI 和 Antigravity**:三个工具各自独立监控、刷新、预热。
 - **抗限流的自动续期**:实时配额查不到时,会退而求其次去看本地 CLI 的真实活动记录来判断要不要续窗口——配额查询接口被限流,不再连累这个 app 真正该干的事。
 - **开窗回执**:预热之后会再查一次配额,确认窗口真的开了,不会出现"命令发了但其实没生效"这种情况自己却不知道。
 - **健康监测**:如果 app 哪天真的停止检查配额了,菜单栏和面板会明说,而不是继续装作一切正常。
@@ -33,26 +34,29 @@
 
 ## 这样用合规吗?
 
-QuotaWarmer 用的是你本来就付费买下的额度,走的是你已经登录的官方 CLI。它不会绕过或提高你的限额,不会分享或上传你的凭据,Monitor 或 Off 状态下什么都不会发送。服务商随时可能调整接口规则;如果自动预热哪天不被允许了,把工具切到 Monitor,QuotaWarmer 还是能继续帮你看着配额。
+QuotaWarmer 用的是你本来就付费买下的额度,走的是你已经登录的官方 CLI。它不会绕过或提高你的限额,不会分享或上传你的凭据,关闭状态或 Monitor / Off 档位下什么都不会发送。服务商随时可能调整接口规则;如果自动预热哪天不被允许了,把工具切到 Monitor,QuotaWarmer 还是能继续帮你看着配额。
 
 ## 工作原理
 
-Claude Code 和 Codex CLI 用的是滚动配额窗口。如果窗口只能靠你自己想起来去用一下才会开始计时,那有一部分可用时间就白白浪费掉了。
+Claude Code、Codex CLI 和 Antigravity 用的都是 5 小时滚动配额窗口加每周配额上限。如果窗口只能靠你自己想起来去用一下才会开始计时,那有一部分可用时间就白白浪费掉了。
 
-QuotaWarmer 安安静静地跑在菜单栏,定期检查被监控工具的配额状态。设成 Auto-warm 的工具,一旦检测到新窗口——不管是通过实时配额读数,还是(在配额接口查不到的情况下)通过"最近本地完全没有活动记录"这个信号——就会在一个隔离的临时工作目录里跑一条最小化的预热命令:
+QuotaWarmer 安安静静地跑在菜单栏,定期检查已启用工具的配额状态(对于 Antigravity,优先读取本机运行中的 Antigravity 桌面端 / IDE 本地服务,未打开桌面端时自动走零 token 消耗的 `agy -p /usage --output-format json`)。设成 Auto-warm 的工具,一旦检测到新窗口——不管是通过实时配额读数,还是(在配额接口查不到的情况下)通过"最近本地完全没有活动记录"这个信号——就会在一个隔离的临时工作目录里跑一条最小化的预热命令:
 
 ```bash
 claude --model haiku --effort low --no-session-persistence --max-turns 1 --tools '' -p 'hi'
 codex exec -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral --ignore-rules 'hi'
+agy --effort low --print-timeout 45s -p 'hi'
 ```
 
-Codex 用的是你 Codex 配置里的默认模型,不写死某一个——写死的模型迟早会被下线(ChatGPT 账号下的 `gpt-5.4-mini` 就是这样)。装了 ChatGPT.app 的话,优先用它内置的 `codex`,而不是 npm 全局装的那个:npm 装的不会自己更新,旧客户端会被服务端拒绝使用当前的模型。
+Codex 和 Antigravity 用的都是你本地配置里的默认模型,不写死某一个——写死的模型迟早会被下线(ChatGPT 账号下的 `gpt-5.4-mini` 就是这样,`agy` 的无头模式遇到已下线模型名也会直接报错退出)。装了 ChatGPT.app 的话,优先用它内置的 `codex`,而不是 npm 全局装的那个:npm 装的不会自己更新,旧客户端会被服务端拒绝使用当前的模型。
 
 本地活动读取自:
 
 ```text
 ~/.claude/projects/*/*.jsonl
 ~/.codex/sessions/YYYY/MM/DD/*.jsonl
+~/.gemini/antigravity-cli/conversations/*.db
+~/.gemini/antigravity/conversations/*.db
 ```
 
 这些日志一方面给界面提供上下文,另一方面——因为它们反映的是真实使用情况而不是一次网络请求——在实时接口失灵的时候,能撑住自动续期的判断。
@@ -63,8 +67,9 @@ Codex 用的是你 Codex 配置里的默认模型,不写死某一个——写死
 | --- | --- |
 | macOS | 14.0 Sonoma 或更高 |
 | Xcode | 16+(仅本地编译需要,见下文) |
-| Claude Code | 已安装,且在 shell 的 `PATH` 里能找到 |
-| Codex CLI | 已安装,且在 shell 的 `PATH` 里能找到 |
+| Claude Code | 按需安装(关闭 Claude 时无需安装) |
+| Codex CLI | 按需安装,在 shell 的 `PATH` 里能找到 |
+| Antigravity (`agy`) | 按需安装 Antigravity 应用或 `agy` CLI(1.1.11+) |
 
 ## 安装
 

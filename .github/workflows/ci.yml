@@ -22,7 +22,7 @@ env:
 jobs:
   build:
     name: Generate Project and Build
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 25
 
     steps:
@@ -33,7 +33,9 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.3.app
 
       - name: Install XcodeGen
-        run: brew install xcodegen
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
 
       - name: Generate Xcode project
         run: xcodegen generate
@@ -49,6 +51,7 @@ jobs:
             Sources/QuotaWarmer/Services/CredentialStore.swift \
             Sources/QuotaWarmer/Services/WarmupRunner.swift \
             Sources/QuotaWarmer/Services/QuotaProvider.swift \
+            Sources/QuotaWarmer/Services/ActivityScanner.swift \
             Sources/QuotaWarmer/Services/LocalUsageProvider.swift \
             scripts/quota-extractor-regression.swift \
             -o /tmp/quota-extractor-regression

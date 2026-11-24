@@ -10,21 +10,25 @@ cd "$ROOT_DIR"
 # Regenerate the Xcode project so newly added/removed sources and any project.yml
 # change (version, entitlements, build settings) are actually part of this build.
 # Without this the build can silently use a stale .xcodeproj.
-if command -v xcodegen >/dev/null 2>&1; then
+if command -v xcodegen >/dev/null 2>&1 \
+  && xcodebuild -version >/dev/null 2>&1 \
+  && xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
   echo "Regenerating Xcode project from project.yml..."
   xcodegen generate
 else
-  echo "ERROR: xcodegen not found; cannot guarantee the project matches project.yml."
-  echo "       Install it with: brew install xcodegen"
-  exit 1
+  echo "Local Xcode / xcodegen not initialized (or missing -runFirstLaunch); installing prebuilt universal DMG instead..."
+  exec "$ROOT_DIR/scripts/install-dmg.command"
 fi
 
 echo "Building QuotaWarmer Release..."
-xcodebuild -project QuotaWarmer.xcodeproj \
+if ! xcodebuild -project QuotaWarmer.xcodeproj \
   -scheme QuotaWarmer \
   -configuration Release \
   -derivedDataPath "$BUILD_DIR" \
-  build
+  build; then
+  echo "Local xcodebuild failed; falling back to prebuilt universal DMG..."
+  exec "$ROOT_DIR/scripts/install-dmg.command"
+fi
 
 # Quit the running instance first. macOS will not start a second copy of an app
 # that is already running, so `open` at the end would just re-focus the OLD build

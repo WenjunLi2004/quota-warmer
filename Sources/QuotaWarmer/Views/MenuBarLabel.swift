@@ -15,17 +15,23 @@ enum MenuBarStatus {
     }
 
     private static func isHealthy(_ appState: AppState) -> Bool {
-        guard !appState.globalPassive, !appState.watcherStale else { return false }
+        guard !appState.globalPassive, !appState.watcherStale, !appState.enabledTools.isEmpty else { return false }
         return appState.toolStates.values.allSatisfy { state in
             if !state.isMonitored { return true }
             return state.sourceHealth == .healthy && state.freshness == .fresh
         }
     }
 
-    /// Tools the user has pinned to the menu bar, shown side by side. Order
-    /// follows `ToolID.allCases` so the layout is stable.
+    /// Enabled tools the user has pinned to the menu bar, shown side by side.
+    /// Order follows `ToolID.allCases` so the layout is stable.
     private static func visibleTools(_ appState: AppState) -> [ToolID] {
-        ToolID.allCases.filter { appState.state(for: $0).menuBarVisible }
+        ToolID.allCases.filter {
+            let st = appState.state(for: $0)
+            return ToolEnablementPolicy.effectiveMenuBarVisible(
+                isEnabled: st.isEnabled,
+                menuBarVisible: st.menuBarVisible
+            )
+        }
     }
 
     private static func composeItems(_ appState: AppState) -> [MenuBarComposer.Item] {
@@ -49,7 +55,7 @@ enum MenuBarStatus {
                 // would make a not-yet-started window look active.
                 text = "\(Int((st.primaryMetric?.remainingFraction ?? 1) * 100))%"
             } else if let r = st.timeUntilReset {
-                text = compactQuotaText(time: r, metric: st.primaryMetric)
+                text = compactQuotaText(time: r, metric: st.primaryMetric, style: appState.menuBarDisplayStyle)
             } else if st.primaryWindowRolledOver {
                 // The known reset already passed while polling was blocked, so the
                 // window rolled over and quota is restored. Report that instead of
@@ -72,7 +78,7 @@ enum MenuBarStatus {
             }
 
             return MenuBarComposer.Item(
-                assetName: tool == .claude ? "ClaudeCode" : "Codex",
+                assetName: tool.assetName,
                 dotColor: nsStatusColor(for: st, appState: appState),
                 text: text,
                 // Follows the menu bar's own appearance instead of assuming a
@@ -97,10 +103,17 @@ enum MenuBarStatus {
         return "\(h):\(String(format: "%02d", m))"
     }
 
-    private static func compactQuotaText(time: TimeInterval, metric: QuotaMetric?) -> String {
+    private static func compactQuotaText(time: TimeInterval, metric: QuotaMetric?, style: MenuBarDisplayStyle) -> String {
         let percent = Int((metric?.remainingFraction ?? 0) * 100)
-        // Middle dot rather than a hyphen: "1h05m - 71%" reads as a subtraction.
-        return "\(compactTime(time)) · \(percent)%"
+        switch style {
+        case .both:
+            // Middle dot rather than a hyphen: "1h05m - 71%" reads as a subtraction.
+            return "\(compactTime(time)) · \(percent)%"
+        case .percentOnly:
+            return "\(percent)%"
+        case .countdownOnly:
+            return compactTime(time)
+        }
     }
 
     /// Nil while the tool is healthy and warming. A badge that is green

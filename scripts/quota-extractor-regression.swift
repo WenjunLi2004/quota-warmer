@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 @main
 struct QuotaExtractorRegression {
@@ -798,6 +803,19 @@ struct QuotaExtractorRegression {
             !warmupRunnerSource.contains("switch await claudeAuthenticationStatus(pathPrefix: pathPrefix)"),
             "Claude warmup must let the actual command, not a headless status preflight, determine auth failure"
         )
+        testProviderEnableDisableControls()
+        testAntigravityQuotaAndParser()
+        testAntigravityLocalUsageAndActivity()
+        testSmartSchedulingAndAlertPolicies()
+        testCodexTokenCountingAccuracyFixes()
+        testOpenUsageFourBarAndTokenAnalytics()
+
+        let asyncDone = DispatchSemaphore(value: 0)
+        Task.detached {
+            await testAntigravityLiveSubprocessFlow()
+            asyncDone.signal()
+        }
+        asyncDone.wait()
 
         print("quota extractor regression tests passed")
     }
@@ -925,4 +943,922 @@ struct QuotaExtractorRegression {
         }
         return source
     }
+
+    // MARK: - Provider Enable/Disable Regression Coverage
+
+    private static func testProviderEnableDisableControls() {
+        let suiteName = "com.quotawarmer.regression.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            fatalError("Could not create isolated UserDefaults suite")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        // Default: every provider starts enabled.
+        for tool in ToolID.allCases {
+            require(
+                ToolEnablementPolicy.isEnabled(for: tool, defaults: defaults),
+                "\(tool.rawValue) should default to enabled"
+            )
+        }
+
+        // Actively turning Claude off persists and suppresses monitoring, auto-warm, and menu bar pin.
+        ToolEnablementPolicy.setEnabled(false, for: .claude, defaults: defaults)
+        require(!ToolEnablementPolicy.isEnabled(for: .claude, defaults: defaults), "Claude should persist as disabled")
+        require(ToolEnablementPolicy.isEnabled(for: .codex, defaults: defaults), "Disabling Claude must not affect Codex")
+        require(ToolEnablementPolicy.isEnabled(for: .antigravity, defaults: defaults), "Disabling Claude must not affect Antigravity")
+        require(
+            !ToolEnablementPolicy.effectiveMonitored(isEnabled: false, mode: .monitor)
+                && !ToolEnablementPolicy.effectiveMonitored(isEnabled: false, mode: .autoWarm),
+            "Disabled Claude must never poll quota regardless of stored mode"
+        )
+        require(
+            !ToolEnablementPolicy.effectiveAutoWarm(isEnabled: false, mode: .autoWarm),
+            "Disabled Claude must never auto-warm"
+        )
+        require(
+            !ToolEnablementPolicy.effectiveMenuBarVisible(isEnabled: false, menuBarVisible: true),
+            "Disabled Claude must be hidden from the menu bar even when menuBarVisible was pinned"
+        )
+
+        // Turning Claude back on restores monitoring and preserves prior mode/pin preferences.
+        ToolEnablementPolicy.setEnabled(true, for: .claude, defaults: defaults)
+        require(ToolEnablementPolicy.isEnabled(for: .claude, defaults: defaults), "Claude must turn back on cleanly")
+        require(
+            ToolEnablementPolicy.restoredModeOnEnable(currentMode: .off) == .monitor,
+            "Re-enabling a provider left on .off should resume safe read-only monitoring"
+        )
+        require(
+            ToolEnablementPolicy.restoredModeOnEnable(currentMode: .autoWarm) == .autoWarm
+                && ToolEnablementPolicy.restoredModeOnEnable(currentMode: .monitor) == .monitor,
+            "Re-enabling a provider must preserve its prior .monitor or .autoWarm mode"
+        )
+        require(
+            ToolEnablementPolicy.effectiveMenuBarVisible(isEnabled: true, menuBarVisible: true),
+            "Re-enabling Claude must restore its menu bar pin"
+        )
+
+        // Verify UI and AppState wiring for provider enable/disable across all entry points.
+        let appStateSource = readSource("Sources/QuotaWarmer/AppState.swift")
+        require(
+            appStateSource.contains("func setToolEnabled(_ enabled: Bool, for tool: ToolID)")
+                && appStateSource.contains("guard state.isEnabled else { return }")
+                && appStateSource.contains("guard state.isEnabled, !state.isWarming else { return false }"),
+            "AppState must gate quota polling and warmup execution on state.isEnabled"
+        )
+        require(
+            readSource("Sources/QuotaWarmer/Views/MenuBarLabel.swift")
+                .contains("ToolEnablementPolicy.effectiveMenuBarVisible"),
+            "MenuBarLabel must hide disabled providers"
+        )
+        require(
+            readSource("Sources/QuotaWarmer/Views/MenuContent.swift")
+                .contains("ForEach(appState.enabledTools)"),
+            "Sidebar must hide disabled providers"
+        )
+        let mainTabSource = readSource("Sources/QuotaWarmer/Views/MainTabView.swift")
+        require(
+            mainTabSource.contains("appState.enabledTools")
+                && mainTabSource.contains("appState.disabledTools")
+                && mainTabSource.contains("setToolEnabled(false, for: tool)")
+                && mainTabSource.contains("setToolEnabled(true, for: tool)"),
+            "MainTabView must allow turning a provider off and turning it back on directly"
+        )
+        require(
+            readSource("Sources/QuotaWarmer/Views/SettingsTabView.swift")
+                .contains("group(\"PROVIDERS\")"),
+            "SettingsTabView must expose a PROVIDERS section to toggle tools on and off"
+        )
+        require(
+            readSource("Sources/QuotaWarmer/AppDelegate.swift")
+                .contains("toggleProviderEnabled"),
+            "Menu bar right-click menu must allow toggling providers on and off"
+        )
+    }
+
+    // MARK: - Antigravity Quota, Probe, and Warmup Regression Coverage
+
+    private static func testAntigravityQuotaAndParser() {
+        let provider = QuotaProvider()
+        let now = Date()
+        let formatter = ISO8601DateFormatter()
+        let geminiSessionReset = now.addingTimeInterval((3 * 3600) + (48 * 60))
+        let geminiWeeklyReset = now.addingTimeInterval(4 * 24 * 3600)
+        let claudeSessionReset = now.addingTimeInterval((4 * 3600) + (29 * 60))
+        let claudeWeeklyReset = now.addingTimeInterval(5 * 24 * 3600)
+
+        // ToolID metadata & asset checks.
+        require(ToolID.allCases.contains(.antigravity), "ToolID.allCases must include .antigravity")
+        require(ToolID.antigravity.cliExecutableName == "agy", "Antigravity CLI executable must be agy")
+        require(ToolID.antigravity.assetName == "Antigravity", "Antigravity asset name must match Assets.xcassets")
+        require(
+            !ToolID.antigravity.warmupCommand.contains("--model")
+                && ToolID.antigravity.warmupCommand.contains("--effort low")
+                && ToolID.antigravity.warmupCommand.contains("-p 'hi'"),
+            "Antigravity warmup must use agy headless low-effort mode without a brittle pinned model"
+        )
+        require(
+            ToolID.antigravity.fallbackWarmupCommand != nil
+                && !(ToolID.antigravity.fallbackWarmupCommand ?? "").contains("--effort")
+                && !(ToolID.antigravity.fallbackWarmupCommand ?? "").contains("--model"),
+            "Antigravity fallback warmup must drop --effort without pinning a model"
+        )
+        let svgAsset = readSource("Sources/QuotaWarmer/Assets.xcassets/Antigravity.imageset/antigravity.svg")
+        require(svgAsset.contains("fill=\"currentColor\""), "Antigravity SVG asset must be a template currentColor vector")
+
+        // 1. Structured `agy -p /usage --output-format json` payload with multiple model groups.
+        let cliUsagePayload: [String: Any] = [
+            "conversation_id": "",
+            "status": "SUCCESS",
+            "response": "Quota report",
+            "duration_seconds": 0,
+            "num_turns": 0,
+            "command": [
+                "name": "usage",
+                "data": [
+                    "description": "Models share limits",
+                    "groups": [
+                        [
+                            "name": "Gemini Models",
+                            "buckets": [
+                                [
+                                    "id": "gemini-weekly",
+                                    "name": "Weekly Limit Remaining",
+                                    "window": "weekly",
+                                    "remaining_fraction": 0.86,
+                                    "reset_time": formatter.string(from: geminiWeeklyReset)
+                                ],
+                                [
+                                    "id": "gemini-5h",
+                                    "name": "Five Hour Limit Remaining",
+                                    "window": "5h",
+                                    "remaining_fraction": 0.95,
+                                    "reset_time": formatter.string(from: geminiSessionReset)
+                                ]
+                            ]
+                        ],
+                        [
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                [
+                                    "id": "3p-weekly",
+                                    "name": "Weekly Limit Remaining",
+                                    "window": "weekly",
+                                    "remaining_fraction": 0.89,
+                                    "reset_time": formatter.string(from: claudeWeeklyReset)
+                                ],
+                                [
+                                    "id": "3p-5h",
+                                    "name": "Five Hour Limit Remaining",
+                                    "window": "5h",
+                                    "remaining_fraction": 1.0,
+                                    "reset_time": formatter.string(from: claudeSessionReset)
+                                ]
+                            ]
+                        ],
+                        [
+                            "name": "Gemini 4 Argon",
+                            "buckets": [
+                                [
+                                    "id": "gemini-argon-wtu-weekly",
+                                    "name": "Gemini 4 Argon Weekly Limit",
+                                    "window": "weekly",
+                                    "remaining_fraction": 0.53,
+                                    "reset_time": formatter.string(from: geminiWeeklyReset)
+                                ]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+
+        let cliSnap = provider.antigravitySnapshot(
+            payload: cliUsagePayload,
+            source: "Antigravity CLI usage",
+            message: "agy CLI",
+            now: now
+        )
+        requireClose(cliSnap.fiveHour?.remainingFraction, 0.95, "Antigravity must pick active 0.95 Gemini 5h over untouched 1.0 3p 5h")
+        requireClose(cliSnap.weekly?.remainingFraction, 0.53, "Antigravity must pick most constrained weekly pool (0.53 Argon)")
+        require(cliSnap.fiveHour?.isIdle == false, "Active Antigravity 5h window must not be flagged idle")
+        require(cliSnap.extras.count == 3, "Remaining Antigravity buckets must be preserved in extras")
+
+        // Tie-breaker: when Gemini and 3P have equal remaining quota, Gemini wins.
+        let tiedPayload: [String: Any] = [
+            "groups": [
+                [
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        ["bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.80, "resetTime": formatter.string(from: claudeSessionReset)]
+                    ]
+                ],
+                [
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        ["bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.80, "resetTime": formatter.string(from: geminiSessionReset)]
+                    ]
+                ]
+            ]
+        ]
+        let tiedSnap = provider.antigravitySnapshot(payload: tiedPayload, source: "test", message: nil, now: now)
+        require(tiedSnap.fiveHour?.detail == "Gemini", "Equal-remaining Antigravity pools must prefer Gemini")
+
+        // Error CLI report must be rejected (no fabricated metrics).
+        let failedCLIPayload: [String: Any] = [
+            "status": "ERROR",
+            "error": "authentication required"
+        ]
+        let failedCLISnap = provider.antigravitySnapshot(payload: failedCLIPayload, source: "test", message: nil, now: now)
+        require(failedCLISnap.fiveHour == nil && failedCLISnap.weekly == nil && failedCLISnap.extras.isEmpty,
+                "Non-SUCCESS Antigravity CLI report must produce no metrics")
+
+        // 2. Local RetrieveUserQuotaSummary protobuf oneof + disabled/unknown bucket filtering.
+        let localSummaryPayload: [String: Any] = [
+            "response": [
+                "groups": [
+                    [
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            [
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit",
+                                "disabled": true,
+                                "remaining": ["remainingFraction": 0.10]
+                            ],
+                            [
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit",
+                                "remaining": ["case": "remainingFraction", "value": 0.64],
+                                "resetTime": formatter.string(from: geminiWeeklyReset)
+                            ],
+                            [
+                                "bucketId": "gemini-mystery",
+                                "displayName": "Unknown Bucket"
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        let localSummarySnap = provider.antigravitySnapshot(
+            payload: localSummaryPayload,
+            source: "Antigravity local server",
+            message: "Antigravity app",
+            now: now
+        )
+        require(localSummarySnap.fiveHour == nil, "Disabled Antigravity 5h bucket must be ignored")
+        requireClose(localSummarySnap.weekly?.remainingFraction, 0.64, "Protobuf oneof remainingFraction must parse")
+        require(localSummarySnap.extras.isEmpty, "Buckets without remainingFraction must not render as 0% exhausted")
+
+        // Non-OK RPC code must be rejected.
+        let rpcErrorSnap = provider.antigravitySnapshot(
+            payload: ["code": 16, "groups": [["displayName": "Gemini Models", "buckets": [["bucketId": "gemini-5h", "remainingFraction": 0.5]]]]],
+            source: "test",
+            message: nil,
+            now: now
+        )
+        require(rpcErrorSnap.fiveHour == nil, "Non-zero RPC code must be rejected")
+
+        // 3. Antigravity idle (unopened) vs freshly-claimed 5h window semantics.
+        let resetlessIdlePayload: [String: Any] = [
+            "groups": [
+                [
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        ["bucketId": "gemini-5h", "window": "5h", "remainingFraction": 1.0],
+                        ["bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.92, "resetTime": formatter.string(from: geminiWeeklyReset)]
+                    ]
+                ]
+            ]
+        ]
+        let idleSnap = provider.antigravitySnapshot(
+            payload: resetlessIdlePayload,
+            source: "Antigravity CLI usage",
+            message: nil,
+            now: now
+        )
+        require(idleSnap.fiveHour?.isIdle == true && idleSnap.fiveHour?.isIdleFiveHourWindow == true,
+                "Reset-less full Antigravity 5h bucket must surface as an idle 5h window")
+        require(idleSnap.fiveHour?.resetAt != nil, "Idle Antigravity 5h window must carry a projected reset")
+        require(idleSnap.rawWindowKey == "Antigravity CLI usage|idle", "Idle Antigravity window must use stable idle key")
+        require(idleSnap.canAutoWarm(now: now, windowDuration: ToolID.antigravity.windowDuration),
+                "Idle Antigravity 5h window must be claimable by auto-warm")
+        require(!idleSnap.showsActiveWindow(now: now),
+                "Idle Antigravity 5h window must not falsely confirm an unopened claim")
+
+        // Sliding 5h projection (`remaining: 1.0`, `resetTime: now + 5h`) is also idle.
+        let slidingIdlePayload: [String: Any] = [
+            "groups": [
+                [
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        ["bucketId": "gemini-5h", "window": "5h", "remainingFraction": 1.0, "resetTime": formatter.string(from: now.addingTimeInterval(5 * 3600))]
+                    ]
+                ]
+            ]
+        ]
+        let slidingIdleSnap = provider.antigravitySnapshot(payload: slidingIdlePayload, source: "test", message: nil, now: now)
+        require(slidingIdleSnap.fiveHour?.isIdle == true && !slidingIdleSnap.showsActiveWindow(now: now),
+                "Full 5h sliding reset projection must stay flagged idle")
+
+        // 30s after warm-up, even if a tiny 'hi' leaves remaining_fraction rounded at 1.0,
+        // the anchored resetTime (now + 5h - 30s) proves the window actually opened.
+        let openedAt100Payload: [String: Any] = [
+            "groups": [
+                [
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        ["bucketId": "gemini-5h", "window": "5h", "remainingFraction": 1.0, "resetTime": formatter.string(from: now.addingTimeInterval(5 * 3600 - 30))]
+                    ]
+                ]
+            ]
+        ]
+        let openedAt100Snap = provider.antigravitySnapshot(payload: openedAt100Payload, source: "test", message: nil, now: now)
+        require(openedAt100Snap.fiveHour?.isIdle == false && openedAt100Snap.showsActiveWindow(now: now),
+                "Anchored <5h reset must confirm an opened Antigravity window even when remaining rounds to 100%")
+
+        // 4. Legacy GetUserStatus / GetCommandModelConfigs (`clientModelConfigs`) fallback.
+        let legacyUserStatusPayload: [String: Any] = [
+            "code": 0,
+            "userStatus": [
+                "email": "dev@example.com",
+                "cascadeModelConfigData": [
+                    "clientModelConfigs": [
+                        [
+                            "label": "Gemini Flash Lite",
+                            "modelOrAlias": ["model": "gemini-flash-lite"],
+                            "quotaInfo": ["remainingFraction": 0.05, "resetTime": formatter.string(from: geminiSessionReset)]
+                        ],
+                        [
+                            "label": "Tab Autocomplete",
+                            "modelOrAlias": ["model": "tab_flash"],
+                            "quotaInfo": ["remainingFraction": 0.10, "resetTime": formatter.string(from: geminiSessionReset)]
+                        ],
+                        [
+                            "label": "Gemini 3.8 Flash (High)",
+                            "modelOrAlias": ["model": "gemini-3.8-flash-high"],
+                            "quotaInfo": ["remainingFraction": 0.77, "resetTime": formatter.string(from: geminiSessionReset)]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        let legacySnap = provider.antigravitySnapshot(payload: legacyUserStatusPayload, source: "Antigravity local server", message: nil, now: now)
+        requireClose(legacySnap.fiveHour?.remainingFraction, 0.77, "Legacy clientModelConfigs must ignore lite/tab_ models and pick primary Gemini model")
+
+        // 5. Local process list, listening ports, version parsing, and credential parsing.
+        let psSample = """
+          101 /usr/sbin/syslogd
+          412 /Applications/Antigravity IDE.app/Contents/Resources/extensions/antigravity/bin/language_server_macos_arm --app_data_dir antigravity-ide --csrf_token ide-secret-token --extension_server_port 49100
+          389 /Applications/Antigravity.app/Contents/Helpers/language_server_macos_arm --app_data_dir antigravity --csrf_token app-secret-token --extension_server_port=49200 --extension_server_csrf_token=ext-secret-token
+          510 /Applications/Antigravity.app/Contents/Helpers/language_server_macos_arm --app_data_dir antigravity
+        """
+        let processes = AntigravityLocalProbe.parseProcessList(psSample)
+        require(processes.count == 2, "Only tokenized Antigravity language_server processes should match")
+        require(processes[0].kind == .app && processes[0].pid == 389 && processes[0].csrfToken == "app-secret-token",
+                "Antigravity 2.0 app server must sort ahead of IDE extension server")
+        require(processes[0].extensionPort == 49200 && processes[0].extensionServerCSRFToken == "ext-secret-token",
+                "Equals-form extension port and token flags must parse")
+        require(processes[1].kind == .ide && processes[1].pid == 412, "IDE language server must classify as .ide")
+
+        let lsofSample = """
+        COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+        language_ 389 user   12u  IPv4 0x1234      0t0  TCP 127.0.0.1:54321 (LISTEN)
+        language_ 389 user   15u  IPv4 0x1235      0t0  TCP 127.0.0.1:54322 (LISTEN)
+        """
+        let ports = AntigravityLocalProbe.parseListeningPorts(lsofSample)
+        require(ports == [54321, 54322], "lsof LISTEN ports must be extracted and sorted")
+        let endpoints = AntigravityLocalProbe.candidateEndpoints(for: processes[0], listeningPorts: ports)
+        require(endpoints.first?.scheme == "https" && endpoints.first?.port == 54321,
+                "HTTPS language-server port must be probed first")
+        require(endpoints.contains(where: { $0.scheme == "http" && $0.port == 49200 && $0.csrfToken == "ext-secret-token" }),
+                "Extension server HTTP fallback must carry extensionServerCSRFToken")
+
+        require(AntigravityVersionCache.parseVersion("1.5.7\n")! == (1, 5, 7), "Plain semver must parse")
+        require(AntigravityVersionCache.parseVersion("agy version 1.2.3 (darwin/arm64)")! == (1, 2, 3), "Prefixed semver must parse")
+        require(AntigravityVersionCache.parseVersion("invalid") == nil, "Invalid version output must return nil")
+
+        let agyTokenJSON = """
+        {
+          "token": {
+            "access_token": "ya29.a0AfH6SMBxMockTokenValue123456",
+            "token_type": "Bearer",
+            "refresh_token": "1//0gMockRefreshTokenValue123456",
+            "expiry": "2026-12-01T10:20:30.456789Z"
+          },
+          "auth_method": "consumer"
+        }
+        """.data(using: .utf8)!
+        let parsedCred = CredentialStore().parseAntigravityCredential(agyTokenJSON, source: "test")
+        require(parsedCred?.accessToken == "ya29.a0AfH6SMBxMockTokenValue123456", "Antigravity file token access_token must parse")
+        require(parsedCred?.refreshToken == "1//0gMockRefreshTokenValue123456", "Antigravity file token refresh_token must parse")
+        require(parsedCred?.expiresAt != nil, "Antigravity fractional ISO8601 expiry must parse")
+
+        require(WarmupRunner.isAntigravityAuthenticationFailure("Select login method:\n1. Google"),
+                "Interactive login prompt must classify as Antigravity auth failure")
+        require(WarmupRunner.isAntigravityAuthenticationFailure("Error: authentication required; run agy to sign in"),
+                "Headless auth error must classify as Antigravity auth failure")
+    }
+
+    private static func testAntigravityLocalUsageAndActivity() {
+        let usageProvider = LocalUsageProvider(calendar: utcCalendar)
+        let now = isoDate("2026-06-15T12:00:00Z")
+        let root = temporaryDirectory("antigravity-local-usage")
+        defer { try? FileManager.default.removeItem(at: root) }
+        createDirectory(root)
+
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T09:00:00Z","conversation_id":"conv_1","model":"gemini-3.8-flash-medium","usage":{"input_tokens":2000,"cache_read_tokens":1000,"output_tokens":500,"total_tokens":2500}}"#,
+            #"{"timestamp":"2026-06-15T09:00:01Z","conversation_id":"conv_1","model":"gemini-3.8-flash-medium","usage":{"input_tokens":2000,"cache_read_tokens":1000,"output_tokens":500,"total_tokens":2500}}"#,
+            #"{"timestamp":1781431200000,"sessionId":"sess_yesterday","model":"gemini-4-neon-high","inputTokens":1000,"cacheReadTokens":0,"outputTokens":200,"totalTokens":1200}"#
+        ], to: root.appendingPathComponent("sessions.jsonl"))
+
+        let summary = usageProvider.usage(for: .antigravity, baseURL: root, now: now)
+        require(summary.source == "Antigravity local usage", "Antigravity local usage source label")
+        require(summary.today.totalTokens == 2_500, "Antigravity local usage must dedupe repeated conversation envelopes")
+        require(summary.yesterday.totalTokens == 1_200, "Antigravity local usage must parse epoch-ms tokscale records")
+        require(summary.last30Days.totalTokens == 3_700, "Antigravity 30-day token aggregation")
+        // Flash: (1000 uncached * 0.30 + 1000 cached * 0.03 + 500 output * 2.50) / 1e6 = 0.00158
+        requireClose(summary.today.costUSD, 0.00158, "Antigravity Gemini Flash pricing")
+        // Neon: (1000 * 2.00 + 200 * 12.00) / 1e6 = 0.0044
+        requireClose(summary.yesterday.costUSD, 0.0044, "Antigravity Gemini Neon pricing")
+
+        // ActivityScanner must ignore `conversation_summaries.db` and detect real `.db` conversations.
+        let convDir = temporaryDirectory("antigravity-conversations")
+        defer { try? FileManager.default.removeItem(at: convDir) }
+        createDirectory(convDir)
+
+        let summaryDB = convDir.appendingPathComponent("conversation_summaries.db")
+        FileManager.default.createFile(atPath: summaryDB.path, contents: Data("index".utf8))
+        let scanner = ActivityScanner()
+        require(
+            scanner.lastActivity(for: .antigravity, directories: [convDir]) == nil
+                && scanner.windowStartTime(for: .antigravity, directories: [convDir]) == nil,
+            "conversation_summaries.db index file must not count as user conversation activity"
+        )
+
+        let realSessionDB = convDir.appendingPathComponent("ab12cd34-session.db")
+        FileManager.default.createFile(atPath: realSessionDB.path, contents: Data("sqlite".utf8))
+        require(
+            scanner.lastActivity(for: .antigravity, directories: [convDir]) != nil
+                && scanner.windowStartTime(for: .antigravity, directories: [convDir]) != nil,
+            "Real Antigravity conversation .db files must register local activity"
+        )
+    }
+
+    private static func testAntigravityLiveSubprocessFlow() async {
+        let dir = temporaryDirectory("antigravity-live-cli")
+        defer {
+            unsetenv("ANTIGRAVITY_CLI_PATH")
+            try? FileManager.default.removeItem(at: dir)
+        }
+        createDirectory(dir)
+
+        let mockAgy = dir.appendingPathComponent("agy")
+        let markerFile = dir.appendingPathComponent("warmup-invocations.log")
+        let resetISO = ISO8601DateFormatter().string(from: Date().addingTimeInterval(4 * 3600))
+        let weeklyISO = ISO8601DateFormatter().string(from: Date().addingTimeInterval(5 * 24 * 3600))
+
+        // Phase 1: Healthy `agy` supporting `--version`, `-p /usage --output-format json`,
+        // and rejecting `--effort` once so WarmupRunner exercises its fallback command!
+        let healthyScript = """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          echo "1.5.7"
+          exit 0
+        fi
+        if [ "$1" = "-p" ] && [ "$2" = "/usage" ]; then
+          if [ "$AGY_CLI_DISABLE_AUTO_UPDATE" != "true" ]; then
+            echo "missing AGY_CLI_DISABLE_AUTO_UPDATE" >&2
+            exit 2
+          fi
+          cat <<'JSON'
+        {"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":0.88,"reset_time":"\(resetISO)"},{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.75,"reset_time":"\(weeklyISO)"}]}]}}}
+        JSON
+          exit 0
+        fi
+        echo "args:$* auto_update:$AGY_CLI_DISABLE_AUTO_UPDATE browser:$BROWSER" >> "\(markerFile.path)"
+        for arg in "$@"; do
+          if [ "$arg" = "--effort" ]; then
+            echo "model does not support --effort override" >&2
+            exit 1
+          fi
+        done
+        echo "hi!"
+        exit 0
+        """
+        do {
+            try healthyScript.write(to: mockAgy, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockAgy.path)
+        } catch {
+            fatalError("Failed to write mock agy script: \(error)")
+        }
+
+        setenv("ANTIGRAVITY_CLI_PATH", mockAgy.path, 1)
+
+        // Live end-to-end fetchQuota(for: .antigravity) through mock `agy` binary!
+        do {
+            let liveSnapshot = try await QuotaProvider().fetchQuota(for: .antigravity)
+            require(liveSnapshot.tool == .antigravity, "Live Antigravity snapshot tool id")
+            requireClose(liveSnapshot.fiveHour?.remainingFraction, 0.88, "Live Antigravity 5h quota via agy /usage")
+            requireClose(liveSnapshot.weekly?.remainingFraction, 0.75, "Live Antigravity weekly quota via agy /usage")
+        } catch {
+            fatalError("Live Antigravity fetchQuota failed unexpectedly: \(error)")
+        }
+
+        // Live end-to-end WarmupRunner().warmup(.antigravity) including primary -> fallback retry!
+        do {
+            let warmupResult = try await WarmupRunner().warmup(.antigravity)
+            require(
+                warmupResult.output.contains("Primary warmup command failed; retried with the configured fallback command."),
+                "WarmupRunner must automatically retry with fallbackWarmupCommand when --effort fails"
+            )
+            let invocations = (try? String(contentsOf: markerFile, encoding: .utf8)) ?? ""
+            require(
+                invocations.contains("auto_update:true") && invocations.contains("browser:/usr/bin/false"),
+                "WarmupRunner must pass AGY_CLI_DISABLE_AUTO_UPDATE=true and no-op BROWSER to agy"
+            )
+        } catch {
+            fatalError("Live Antigravity warmup failed unexpectedly: \(error)")
+        }
+
+        // Phase 2: Signed-out `agy` must surface authFailure (QuotaProvider) and authenticationRequired (WarmupRunner).
+        let signedOutAgy = dir.appendingPathComponent("agy-signed-out")
+        let signedOutScript = """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          echo "1.5.7"
+          exit 0
+        fi
+        echo "Select login method:" >&2
+        exit 1
+        """
+        try! signedOutScript.write(to: signedOutAgy, atomically: true, encoding: .utf8)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: signedOutAgy.path)
+        setenv("ANTIGRAVITY_CLI_PATH", signedOutAgy.path, 1)
+
+        do {
+            _ = try await QuotaProvider().fetchQuota(for: .antigravity)
+            fatalError("Signed-out agy should throw QuotaProviderError.authFailure")
+        } catch QuotaProviderError.authFailure {
+            // Expected
+        } catch {
+            fatalError("Expected QuotaProviderError.authFailure for signed-out agy, got \(error)")
+        }
+
+        do {
+            _ = try await WarmupRunner().warmup(.antigravity)
+            fatalError("Signed-out agy warmup should throw WarmupError.authenticationRequired")
+        } catch WarmupError.authenticationRequired {
+            // Expected
+        } catch {
+            fatalError("Expected WarmupError.authenticationRequired for signed-out agy, got \(error)")
+        }
+    }
+
+    private static func testSmartSchedulingAndAlertPolicies() {
+        let baseNow = isoDate("2026-04-17T02:15:00Z")
+
+        // 1. SmartRefreshPolicy accelerates right to reset + 5s when reset is sooner than refreshInterval.
+        let farReset = baseNow.addingTimeInterval(2 * 3600)
+        let normalNext = SmartRefreshPolicy.nextRefreshDate(now: baseNow, refreshInterval: 900, windowResetAt: farReset)
+        require(abs(normalNext.timeIntervalSince(baseNow) - 900) < 0.5, "Far reset should keep normal refresh interval")
+
+        let imminentReset = baseNow.addingTimeInterval(40)
+        let acceleratedNext = SmartRefreshPolicy.nextRefreshDate(now: baseNow, refreshInterval: 900, windowResetAt: imminentReset)
+        require(abs(acceleratedNext.timeIntervalSince(baseNow) - 45) < 0.5, "Imminent reset should accelerate poll to resetAt + 5s")
+
+        let pastReset = baseNow.addingTimeInterval(-30)
+        let pastNext = SmartRefreshPolicy.nextRefreshDate(now: baseNow, refreshInterval: 300, windowResetAt: pastReset)
+        require(abs(pastNext.timeIntervalSince(baseNow) - 300) < 0.5, "Past reset should use normal refresh interval")
+
+        // 2. ActiveHoursPolicy supports daytime and overnight spans in UTC.
+        let cal = utcCalendar
+        require(
+            ActiveHoursPolicy.isWithinActiveHours(now: baseNow, enabled: false, startHour: 8, endHour: 23, calendar: cal),
+            "Disabled active-hours guard must allow all hours"
+        )
+        require(
+            !ActiveHoursPolicy.isWithinActiveHours(now: baseNow, enabled: true, startHour: 8, endHour: 23, calendar: cal),
+            "02:15 UTC must be outside 08:00-23:00 active window"
+        )
+        let daytime = isoDate("2026-04-17T10:30:00Z")
+        require(
+            ActiveHoursPolicy.isWithinActiveHours(now: daytime, enabled: true, startHour: 8, endHour: 23, calendar: cal),
+            "10:30 UTC must be inside 08:00-23:00 active window"
+        )
+        require(
+            ActiveHoursPolicy.isWithinActiveHours(now: baseNow, enabled: true, startHour: 22, endHour: 6, calendar: cal),
+            "02:15 UTC must be inside overnight 22:00-06:00 active window"
+        )
+        require(
+            !ActiveHoursPolicy.isWithinActiveHours(now: daytime, enabled: true, startHour: 22, endHour: 6, calendar: cal),
+            "10:30 UTC must be outside overnight 22:00-06:00 active window"
+        )
+        if let nextStart = ActiveHoursPolicy.nextActiveStart(after: baseNow, startHour: 8, calendar: cal) {
+            require(cal.component(.hour, from: nextStart) == 8, "nextActiveStart should land on hour 8")
+            require(nextStart > baseNow, "nextActiveStart must be strictly after now")
+        } else {
+            fatalError("nextActiveStart should resolve a valid date")
+        }
+
+        // 3. LowQuotaAlertPolicy alerts once per active 5h window and ignores rollover artifacts.
+        let activeReset = daytime.addingTimeInterval(3600)
+        let lowSnap = QuotaSnapshot(
+            tool: .codex,
+            fetchedAt: daytime,
+            primarySource: "Codex test",
+            corroboratingSource: nil,
+            fiveHour: QuotaMetric(name: "5h window", usedPercent: 0.82, remainingPercent: 0.18, resetAt: activeReset, detail: nil),
+            weekly: nil,
+            extras: [],
+            rawWindowKey: "codex|low",
+            message: nil
+        )
+        let firstKey = LowQuotaAlertPolicy.shouldAlert(
+            enabled: true,
+            snapshot: lowSnap,
+            windowDuration: 5 * 3600,
+            lastAlertedKey: nil,
+            now: daytime
+        )
+        require(firstKey != nil, "18% remaining on an active 5h window should trigger low-quota alert")
+
+        let jitteredSnap = QuotaSnapshot(
+            tool: .codex,
+            fetchedAt: daytime.addingTimeInterval(60),
+            primarySource: "Codex test",
+            corroboratingSource: nil,
+            fiveHour: QuotaMetric(name: "5h window", usedPercent: 0.85, remainingPercent: 0.15, resetAt: activeReset.addingTimeInterval(20), detail: nil),
+            weekly: nil,
+            extras: [],
+            rawWindowKey: "codex|low2",
+            message: nil
+        )
+        require(
+            LowQuotaAlertPolicy.shouldAlert(
+                enabled: true,
+                snapshot: jitteredSnap,
+                windowDuration: 5 * 3600,
+                lastAlertedKey: firstKey,
+                now: daytime.addingTimeInterval(60)
+            ) == nil,
+            "Same 5h window with minor reset_after_seconds jitter must not duplicate low-quota alert"
+        )
+
+        let unsettledSnap = QuotaSnapshot(
+            tool: .claude,
+            fetchedAt: daytime,
+            primarySource: "Claude test",
+            corroboratingSource: nil,
+            fiveHour: QuotaMetric(name: "5h window", usedPercent: 0.99, remainingPercent: 0.01, resetAt: daytime.addingTimeInterval(5 * 3600 - 60), detail: nil),
+            weekly: nil,
+            extras: [],
+            rawWindowKey: "claude|unsettled",
+            message: nil
+        )
+        require(
+            LowQuotaAlertPolicy.shouldAlert(
+                enabled: true,
+                snapshot: unsettledSnap,
+                windowDuration: 5 * 3600,
+                lastAlertedKey: nil,
+                now: daytime
+            ) == nil,
+            "Unsettled rollover artifact right after window open must not fire false low-quota alert"
+        )
+
+        // 4. MenuBarDisplayStyle resolution.
+        require(MenuBarDisplayStyle.resolve(rawValue: nil) == .both, "Default menu bar style should be .both")
+        require(MenuBarDisplayStyle.resolve(rawValue: "percent") == .percentOnly, "Percent menu bar style should resolve")
+        require(MenuBarDisplayStyle.resolve(rawValue: "countdown") == .countdownOnly, "Countdown menu bar style should resolve")
+    }
+
+    private static func testCodexTokenCountingAccuracyFixes() {
+        let provider = LocalUsageProvider(calendar: utcCalendar)
+        let now = isoDate("2026-06-15T18:00:00Z")
+        let codexHome = temporaryDirectory("codex-accuracy")
+        defer { try? FileManager.default.removeItem(at: codexHome) }
+
+        let sessionsDir = codexHome.appendingPathComponent("sessions", isDirectory: true)
+        let archivedDir = codexHome.appendingPathComponent("archived_sessions", isDirectory: true)
+        createDirectory(sessionsDir)
+        createDirectory(archivedDir)
+
+        // 1. Root session with duplicate `token_count` snapshots (unchanged total_token_usage)
+        //    and yesterday's history that will be replayed by a subagent today.
+        let rootRollout = sessionsDir.appendingPathComponent("rollout-2026-06-14-root.jsonl")
+        writeJSONL([
+            #"{"timestamp":"2026-06-14T10:00:00Z","type":"session_meta","payload":{"id":"sess_root","model":"gpt-5.4"}}"#,
+            #"{"timestamp":"2026-06-14T10:01:00Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+            #"{"timestamp":"2026-06-14T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            // Duplicate UI / rate_limits refresh re-emits with identical total_token_usage: MUST NOT overcount!
+            #"{"timestamp":"2026-06-14T10:02:05Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            #"{"timestamp":"2026-06-14T10:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            // Second real turn yesterday:
+            #"{"timestamp":"2026-06-14T10:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":28000,"cached_input_tokens":25000,"output_tokens":1000,"total_tokens":29000},"total_token_usage":{"input_tokens":48000,"cached_input_tokens":40000,"output_tokens":2000,"total_tokens":50000}}}}"#
+        ], to: rootRollout)
+
+        // Duplicate copy of the active rollout inside archived_sessions: active copy must win (no double count).
+        try! FileManager.default.copyItem(at: rootRollout, to: archivedDir.appendingPathComponent("rollout-2026-06-14-root.jsonl"))
+
+        // 2. Subagent (`thread_spawn` / `forked_from_id`) spawned TODAY replaying yesterday's parent history
+        //    with TODAY's timestamps, followed by its own real turn using dated `gpt-5.6-2026-06-01` via `model_name`.
+        let subagentRollout = sessionsDir.appendingPathComponent("rollout-2026-06-15-subagent.jsonl")
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T09:00:00Z","type":"session_meta","payload":{"id":"sess_child","forked_from_id":"sess_root","source":{"subagent":{"thread_spawn":true}}}}"#,
+            #"{"timestamp":"2026-06-15T09:00:00.100Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            #"{"timestamp":"2026-06-15T09:00:00.200Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            #"{"timestamp":"2026-06-15T09:00:00.300Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":28000,"cached_input_tokens":25000,"output_tokens":1000,"total_tokens":29000},"total_token_usage":{"input_tokens":48000,"cached_input_tokens":40000,"output_tokens":2000,"total_tokens":50000}}}}"#,
+            #"{"timestamp":"2026-06-15T09:01:00Z","type":"turn_context","payload":{"model_name":"openai/gpt-5.6-2026-06-01"}}"#,
+            #"{"timestamp":"2026-06-15T09:01:10Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7000,"cached_input_tokens":5000,"output_tokens":1000,"total_tokens":8000},"total_token_usage":{"input_tokens":7000,"cached_input_tokens":5000,"output_tokens":1000,"total_tokens":8000}}}}"#
+        ], to: subagentRollout)
+
+        // 3. Archived-only session from today using `token_usage_record` + mirrored `token_count` + long-context `gpt-5.4`.
+        let archivedOnly = archivedDir.appendingPathComponent("rollout-2026-06-15-archived.jsonl")
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T11:00:00Z","type":"session_meta","payload":{"id":"sess_archived","model":"gpt-5.4"}}"#,
+            #"{"timestamp":"2026-06-15T11:05:00Z","type":"token_usage_record","payload":{"thread_id":"sess_archived","response_id":"resp_lc_1","model":"gpt-5.4","usage":{"input_tokens":300000,"cached_input_tokens":250000,"output_tokens":1000,"total_tokens":301000},"thread_token_usage":{"input_tokens":300000,"cached_input_tokens":250000,"output_tokens":1000,"total_tokens":301000}}}"#,
+            #"{"timestamp":"2026-06-15T11:05:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300000,"cached_input_tokens":250000,"output_tokens":1000,"total_tokens":301000},"total_token_usage":{"input_tokens":300000,"cached_input_tokens":250000,"output_tokens":1000,"total_tokens":301000}}}}"#
+        ], to: archivedOnly)
+
+        let summary = provider.usage(for: .codex, baseURL: sessionsDir, now: now)
+        require(summary.yesterday.totalTokens == 50_000, "Yesterday should equal 50,000 tokens without duplicate snapshots, got \(summary.yesterday.totalTokens)")
+        require(summary.today.totalTokens == 309_000, "Today should equal 309,000 tokens (excluding parent replay & ledger mirror), got \(summary.today.totalTokens)")
+        require(summary.today.uncachedInputTokens == 52_000, "Today uncached input should equal 52,000, got \(summary.today.uncachedInputTokens)")
+        require(summary.today.cachedInputTokens == 255_000, "Today cached input should equal 255,000, got \(summary.today.cachedInputTokens)")
+        require(summary.today.outputTokens == 2_000, "Today output should equal 2,000, got \(summary.today.outputTokens)")
+        requireClose(summary.today.costUSD, 0.4275, "Today Codex cost should normalize gpt-5.6 dated slug and apply >272K long-context pricing")
+    }
+
+    private static func testOpenUsageFourBarAndTokenAnalytics() {
+        let quotaProvider = QuotaProvider()
+        let formatter = ISO8601DateFormatter()
+        let now = isoDate("2026-06-15T18:00:00Z")
+        let sReset = now.addingTimeInterval(3 * 3600)
+        let wReset = now.addingTimeInterval(5 * 86_400)
+
+        // 1. Standard 2-group Antigravity payload produces the exact 4 OpenUsage bars
+        //    ["Gemini 5h", "Gemini", "Claude 5h", "Claude"] on both Overview & ToolTabView.
+        let fourBarPayload: [String: Any] = [
+            "groups": [
+                [
+                    "name": "Claude and GPT-OSS",
+                    "buckets": [
+                        ["id": "3p-weekly", "window": "weekly", "remaining_fraction": 0.90, "reset_time": formatter.string(from: wReset)],
+                        ["id": "3p-5h", "window": "5h", "remaining_fraction": 0.95, "reset_time": formatter.string(from: sReset)]
+                    ]
+                ],
+                [
+                    "name": "Gemini Models",
+                    "buckets": [
+                        ["id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.80, "reset_time": formatter.string(from: wReset)],
+                        ["id": "gemini-5h", "window": "5h", "remaining_fraction": 0.85, "reset_time": formatter.string(from: sReset)]
+                    ]
+                ]
+            ]
+        ]
+        let fourBarSnap = quotaProvider.antigravitySnapshot(
+            payload: fourBarPayload,
+            source: "Antigravity CLI usage",
+            message: nil,
+            now: now
+        )
+        require(
+            fourBarSnap.displayMetrics.map(\.name) == ["Gemini 5h", "Gemini", "Claude 5h", "Claude"],
+            "Antigravity displayMetrics must emit canonical 4-bar OpenUsage order, got \(fourBarSnap.displayMetrics.map(\.name))"
+        )
+        requireClose(fourBarSnap.displayMetrics[0].remainingFraction, 0.85, "Gemini 5h remaining")
+        requireClose(fourBarSnap.displayMetrics[1].remainingFraction, 0.80, "Gemini weekly remaining")
+        requireClose(fourBarSnap.displayMetrics[2].remainingFraction, 0.95, "Claude 5h remaining")
+        requireClose(fourBarSnap.displayMetrics[3].remainingFraction, 0.90, "Claude weekly remaining")
+        require(fourBarSnap.displayMetrics[0].windowDurationSeconds == 5 * 3600, "Gemini 5h duration")
+        require(fourBarSnap.displayMetrics[1].windowDurationSeconds == 7 * 86_400, "Gemini weekly duration")
+
+        // 2. Views render displayMetrics on both Overview and ToolTabView, plus Today's Tokens card.
+        let mainViewSource = readSource("Sources/QuotaWarmer/Views/MainTabView.swift")
+        let toolViewSource = readSource("Sources/QuotaWarmer/Views/ToolTabView.swift")
+        require(
+            mainViewSource.contains("displayMetrics") && mainViewSource.contains("todayTokensCard"),
+            "MainTabView must render Antigravity 4-bar displayMetrics and cross-tool todayTokensCard"
+        )
+        require(
+            toolViewSource.contains("displayMetrics") && toolViewSource.contains("TokenBreakdownCard"),
+            "ToolTabView must render Antigravity 4-bar displayMetrics and OpenUsage-style TokenBreakdownCard"
+        )
+
+        // 3. Codex `wham/analytics/daily-workspace-usage-counts` parser matches OpenUsage 0.8+ exactly.
+        let analyticsJSON = """
+        {
+          "data": [
+            {
+              "date": "2026-06-14",
+              "totals": {
+                "turns": 42,
+                "uncached_text_input_tokens": 915800,
+                "cached_text_input_tokens": 5300000,
+                "text_output_tokens": 16400,
+                "text_total_tokens": 6232200
+              },
+              "models": [
+                {
+                  "model": "gpt-6-astra",
+                  "turns": 42,
+                  "text_total_tokens": 6232200
+                }
+              ]
+            },
+            {
+              "date": "2026-06-15",
+              "totals": {
+                "turns": 5,
+                "uncached_text_input_tokens": 100000,
+                "cached_text_input_tokens": 400000,
+                "text_output_tokens": 5000,
+                "text_total_tokens": 505000
+              },
+              "models": [
+                {
+                  "model": "gpt-6-astra",
+                  "turns": 5,
+                  "text_total_tokens": 505000
+                }
+              ]
+            }
+          ]
+        }
+        """
+        let localProvider = LocalUsageProvider(calendar: utcCalendar)
+        guard let remoteSummary = localProvider.codexRemoteSummary(data: Data(analyticsJSON.utf8), now: now) else {
+            fatalError("codexRemoteSummary should parse wham/analytics/daily-workspace-usage-counts JSON")
+        }
+        require(remoteSummary.yesterday.totalTokens == 6_232_200, "Yesterday Codex analytics total tokens")
+        require(remoteSummary.yesterday.cachedInputTokens == 5_300_000, "Yesterday Codex analytics Cache Read")
+        require(remoteSummary.yesterday.uncachedInputTokens == 915_800, "Yesterday Codex analytics Input")
+        require(remoteSummary.yesterday.outputTokens == 16_400, "Yesterday Codex analytics Output")
+        require(remoteSummary.yesterday.topModels == [ModelTokenShare(model: "gpt-6-astra", tokens: 6_232_200, share: 1.0)],
+                "Yesterday Codex analytics topModels should show gpt-6-astra 100%")
+        requireClose(remoteSummary.yesterday.costUSD, 15.278, "Yesterday gpt-6-astra API cost")
+        require(remoteSummary.today.totalTokens == 505_000, "Today Codex analytics total tokens")
+        require(remoteSummary.last30Days.totalTokens == 6_737_200, "30-day Codex analytics total tokens")
+
+        // 4. NSNull safety (`forked_from_id: null`, `model: null`) + `task_started.started_at` child replay gate.
+        let nsNullDir = temporaryDirectory("codex-nsnull-and-replay")
+        defer { try? FileManager.default.removeItem(at: nsNullDir) }
+        let sessDir = nsNullDir.appendingPathComponent("sessions", isDirectory: true)
+        createDirectory(sessDir)
+
+        // Root session with explicit JSON `null` values must NOT become `<null>` or `isForkOrSubagent == true`.
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"root_nulls","forked_from_id":null,"parent_thread_id":null,"source":null,"model":"gpt-6-astra"}}"#,
+            #"{"timestamp":"2026-06-15T10:00:05Z","type":"turn_context","payload":{"model":null}}"#,
+            #"{"timestamp":"2026-06-15T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"output_tokens":500,"total_tokens":10500},"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"output_tokens":500,"total_tokens":10500}}}}"#
+        ], to: sessDir.appendingPathComponent("rollout-2026-06-15-root-nulls.jsonl"))
+
+        // Child spawned at 2026-06-15T12:00:00Z (epoch 1781524800) replaying an >30d-old parent's
+        // `task_started` (started_at: 1775000000) + `turn_context` + `token_count`, then starting its own task!
+        let childSpawnEpoch = Int(isoDate("2026-06-15T12:00:00Z").timeIntervalSince1970)
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T12:00:00Z","type":"session_meta","payload":{"id":"child_1","forked_from_id":"ancient_parent","model":"gpt-6-astra"}}"#,
+            #"{"timestamp":"2026-06-15T12:00:00.050Z","type":"event_msg","payload":{"type":"task_started","started_at":1775000000}}"#,
+            #"{"timestamp":"2026-06-15T12:00:00.060Z","type":"turn_context","payload":{"model":"gpt-6-astra"}}"#,
+            #"{"timestamp":"2026-06-15T12:00:00.070Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":90000,"cached_input_tokens":80000,"output_tokens":1000,"total_tokens":91000},"total_token_usage":{"input_tokens":90000,"cached_input_tokens":80000,"output_tokens":1000,"total_tokens":91000}}}}"#,
+            "{\"timestamp\":\"2026-06-15T12:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"started_at\":\(childSpawnEpoch + 60)}}",
+            #"{"timestamp":"2026-06-15T12:01:10Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":4000,"cached_input_tokens":3000,"output_tokens":500,"total_tokens":4500},"total_token_usage":{"input_tokens":94000,"cached_input_tokens":83000,"output_tokens":1500,"total_tokens":95500}}}}"#
+        ], to: sessDir.appendingPathComponent("rollout-2026-06-15-child-replay.jsonl"))
+
+        let nullSafeSummary = localProvider.usage(for: .codex, baseURL: sessDir, now: now)
+        require(nullSafeSummary.today.totalTokens == 15_000,
+                "Root NSNull session (10,500) + child own task (4,500) must equal 15,000 without counting 91,000 parent replay, got \(nullSafeSummary.today.totalTokens)")
+        require(nullSafeSummary.today.topModels.first?.model == "gpt-6-astra",
+                "JSON null model field must not overwrite gpt-6-astra with <null>, got \(String(describing: nullSafeSummary.today.topModels))")
+
+        // 5. TodayTokenTotalizer aggregates Today tokens across enabled tools and excludes disabled Claude.
+        let claudeFakeSummary = TokenUsageSummary(
+            fetchedAt: now,
+            source: "Claude local usage",
+            today: TokenUsageDay(date: now, totalTokens: 999_999, costUSD: 9.99),
+            yesterday: TokenUsageDay(date: now, totalTokens: 0, costUSD: 0),
+            last30Days: TokenUsageDay(date: now, totalTokens: 999_999, costUSD: 9.99)
+        )
+        let agyFakeSummary = TokenUsageSummary(
+            fetchedAt: now,
+            source: "Antigravity local usage",
+            today: TokenUsageDay(date: now, totalTokens: 195_000, costUSD: 0.45),
+            yesterday: TokenUsageDay(date: now, totalTokens: 0, costUSD: 0),
+            last30Days: TokenUsageDay(date: now, totalTokens: 195_000, costUSD: 0.45)
+        )
+        let crossTool = TodayTokenTotalizer.summarize(
+            enabledTools: [.codex, .antigravity],
+            summaries: [
+                .claude: claudeFakeSummary,
+                .codex: remoteSummary,
+                .antigravity: agyFakeSummary
+            ]
+        )
+        require(crossTool.totalTokens == 700_000,
+                "TodayTokenTotalizer should sum enabled Codex (505K) + Antigravity (195K) = 700K and exclude disabled Claude, got \(crossTool.totalTokens)")
+        require(crossTool.entries.map(\.tool) == [.codex, .antigravity], "TodayTokenTotalizer entries should match enabledTools")
+    }
 }
+

@@ -55,8 +55,12 @@ enum DiagnosticLogger {
         var output = text
         let patterns = [
             #"sk-[A-Za-z0-9._-]{12,}"#,
+            #"ya29\.[A-Za-z0-9._-]{12,}"#,
+            #"1//[A-Za-z0-9._-]{12,}"#,
             #"Bearer\s+[A-Za-z0-9._-]{12,}"#,
-            #"Authorization[:=]\s*[A-Za-z0-9._\-\s]{12,}"#
+            #"Authorization[:=]\s*[A-Za-z0-9._\-\s]{12,}"#,
+            #"X-Codeium-Csrf-Token[:=]\s*[A-Za-z0-9._-]{8,}"#,
+            #"--csrf_token\s+[A-Za-z0-9._-]{8,}"#
         ]
 
         for pattern in patterns {

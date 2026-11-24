@@ -6,12 +6,14 @@ struct MainTabView: View {
     // Session-only display state — never persisted, so every popover open
     // starts with both provider sections expanded (empty = nothing collapsed).
     @State private var collapsedTools: Set<ToolID> = []
+    @State private var expandedTodayTokenTool: ToolID? = nil
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 11) {
                 header
                 if !outcomeTools.isEmpty { statusCard }
+                if !appState.enabledTools.isEmpty { todayTokensCard }
                 providerList
                 historySection
             }
@@ -20,6 +22,92 @@ struct MainTabView: View {
             .padding(.bottom, 12)
         }
         .background(DS.C.bg)
+    }
+
+    private var todayTokensCard: some View {
+        let summary = appState.todayTokensSummary
+        let anyLoading = appState.enabledTools.contains { appState.state(for: $0).isFetchingTokenUsage }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Today's Tokens")
+                    .dsSectionLabel()
+                if anyLoading {
+                    Image(systemName: "hourglass")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(DS.C.textMuted)
+                }
+                Spacer(minLength: 6)
+                Text(TokenFormatting.costAndTokens(costUSD: summary.totalCostUSD, tokens: summary.totalTokens))
+                    .font(DS.mono(11.5, weight: .semibold))
+                    .foregroundStyle(DS.C.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+            }
+
+            if summary.totalTokens > 0 {
+                GeometryReader { geo in
+                    let w = geo.size.width
+                    HStack(spacing: 1.5) {
+                        ForEach(summary.entries.filter { $0.tokens > 0 }) { entry in
+                            Rectangle()
+                                .fill(DS.C.accent(entry.tool))
+                                .frame(width: max(3, w * CGFloat(entry.share)))
+                        }
+                    }
+                    .frame(width: w, height: 5, alignment: .leading)
+                    .clipShape(Capsule())
+                }
+                .frame(height: 5)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(summary.entries) { entry in
+                    let isSelected = expandedTodayTokenTool == entry.tool
+                    Button(action: {
+                        expandedTodayTokenTool = isSelected ? nil : entry.tool
+                    }) {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(DS.C.accent(entry.tool))
+                                .frame(width: 6, height: 6)
+                            Text(entry.tool.shortName)
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(DS.C.textSub)
+                                .lineLimit(1)
+                            Spacer(minLength: 6)
+                            Text(entry.day == nil ? "--" : TokenFormatting.costAndTokens(costUSD: entry.costUSD, tokens: entry.tokens))
+                                .font(DS.mono(10.5, weight: .semibold))
+                                .foregroundStyle(entry.day == nil ? DS.C.textMuted : DS.C.text)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
+                                .padding(.horizontal, isSelected ? 6 : 0)
+                                .padding(.vertical, isSelected ? 2 : 0)
+                                .background(
+                                    Capsule()
+                                        .fill(isSelected ? DS.C.surfaceHigh : Color.clear)
+                                )
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressableButtonStyle())
+                    .help("Click to inspect \(entry.tool.shortName) token breakdown")
+                }
+            }
+
+            if let selectedTool = expandedTodayTokenTool,
+               appState.state(for: selectedTool).isEnabled,
+               let day = appState.state(for: selectedTool).tokenUsageSummary?.today {
+                TokenBreakdownCard(
+                    title: "\(selectedTool.shortName) · Today",
+                    day: day,
+                    accent: DS.C.accent(selectedTool)
+                )
+                .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .dsCard()
     }
 
     private var header: some View {
@@ -56,24 +144,91 @@ struct MainTabView: View {
 
     private var providerList: some View {
         VStack(spacing: 12) {
-            ForEach(ToolID.allCases) { tool in
-                providerRow(tool)
+            if appState.enabledTools.isEmpty {
+                emptyProvidersCard
+            } else {
+                ForEach(appState.enabledTools) { tool in
+                    providerRow(tool)
+                }
+                if !appState.disabledTools.isEmpty {
+                    disabledProvidersBar
+                }
             }
         }
+    }
+
+    private var emptyProvidersCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("All providers are turned off")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(DS.C.text)
+            Text("Turn on any provider below or in Settings whenever you want QuotaWarmer to watch it again.")
+                .font(.system(size: 11))
+                .foregroundStyle(DS.C.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                ForEach(ToolID.allCases) { tool in
+                    enableChip(tool)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsCard()
+    }
+
+    private var disabledProvidersBar: some View {
+        HStack(spacing: 6) {
+            Text("Turned off")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(DS.C.textMuted)
+            Spacer(minLength: 4)
+            ForEach(appState.disabledTools) { tool in
+                enableChip(tool)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .dsCard()
+    }
+
+    private func enableChip(_ tool: ToolID) -> some View {
+        Button(action: { appState.setToolEnabled(true, for: tool) }) {
+            HStack(spacing: 4) {
+                Image(tool.assetName)
+                    .resizable()
+                    .renderingMode(.template)
+                    .scaledToFit()
+                    .frame(width: 11, height: 11)
+                Text("Turn On \(tool.shortName)")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(DS.C.textSub)
+            .padding(.horizontal, 9)
+            .frame(height: 23)
+            .background(DS.C.surfaceHigh, in: Capsule())
+            .overlay(Capsule().stroke(DS.C.border, lineWidth: 1))
+        }
+        .buttonStyle(PressableButtonStyle())
+        .help("Turn \(tool.displayName) back on")
+        .accessibilityLabel(Text("Turn on \(tool.displayName)"))
     }
 
     private func providerRow(_ tool: ToolID) -> some View {
         let state = appState.state(for: tool)
         let collapsed = collapsedTools.contains(tool)
         return VStack(alignment: .leading, spacing: collapsed ? 0 : 12) {
-            // Tool name on the left, the same mode / refresh / pin controls on
-            // the right (where the reference shows the plan badge).
-            HStack(spacing: 8) {
+            // Tool name on the left, the same mode / refresh / pin / off controls
+            // on the right.
+            HStack(spacing: 6) {
                 Button(action: { toggleCollapsed(tool) }) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         Text(tool.shortName)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(DS.C.text)
+                            .lineLimit(1)
                         Image(systemName: collapsed ? "chevron.down" : "chevron.up")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(DS.C.textMuted)
@@ -82,12 +237,12 @@ struct MainTabView: View {
                     // hit area out to a comfortably tappable rectangle instead
                     // of relying on precise glyph-edge hits.
                     .padding(.vertical, 6)
-                    .padding(.trailing, 10)
+                    .padding(.trailing, 6)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(PressableButtonStyle())
                 .accessibilityLabel(Text(collapsed ? "Expand \(tool.shortName) section" : "Collapse \(tool.shortName) section"))
-                Spacer(minLength: 6)
+                Spacer(minLength: 4)
                 ToolModeMenu(mode: state.mode, compact: true) { appState.setMode($0, for: tool) }
                     .fixedSize()
                 IconButton(
@@ -101,6 +256,7 @@ struct MainTabView: View {
                     isDisabled: state.isFetchingQuota
                 ) { Task { await appState.refreshQuotaManually(for: tool) } }
                 menuBarPin(tool, state)
+                disableButton(tool)
             }
 
             if !collapsed {
@@ -111,11 +267,42 @@ struct MainTabView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                windowRow(state, title: "Session", metric: state.primaryMetric,
-                          resetAt: state.resetAt, windowDuration: tool.windowDuration,
-                          settling: state.sessionSettling)
-                windowRow(state, title: "Weekly", metric: state.weeklyMetric,
-                          resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+                if tool == .antigravity {
+                    if let metrics = state.quotaSnapshot?.displayMetrics, !metrics.isEmpty {
+                        ForEach(metrics) { metric in
+                            windowRow(
+                                state,
+                                title: metric.name,
+                                metric: metric,
+                                resetAt: metric.resetAt,
+                                windowDuration: metric.windowDurationSeconds
+                                    ?? AntigravityDisplaySlots.windowDuration(for: metric.name, tool: tool)
+                            )
+                        }
+                    } else if state.primaryMetric != nil || state.weeklyMetric != nil {
+                        windowRow(state, title: "Session", metric: state.primaryMetric,
+                                  resetAt: state.resetAt, windowDuration: tool.windowDuration,
+                                  settling: state.sessionSettling)
+                        windowRow(state, title: "Weekly", metric: state.weeklyMetric,
+                                  resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+                    } else {
+                        ForEach(AntigravityDisplaySlots.defaultTitles, id: \.self) { slotTitle in
+                            windowRow(
+                                state,
+                                title: slotTitle,
+                                metric: nil,
+                                resetAt: nil,
+                                windowDuration: AntigravityDisplaySlots.windowDuration(for: slotTitle, tool: tool)
+                            )
+                        }
+                    }
+                } else {
+                    windowRow(state, title: "Session", metric: state.primaryMetric,
+                              resetAt: state.resetAt, windowDuration: tool.windowDuration,
+                              settling: state.sessionSettling)
+                    windowRow(state, title: "Weekly", metric: state.weeklyMetric,
+                              resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+                }
             }
         }
         .padding(.horizontal, 12)
@@ -183,6 +370,20 @@ struct MainTabView: View {
         .accessibilityLabel(Text(state.menuBarVisible ? "Hide \(tool.shortName) from menu bar" : "Show \(tool.shortName) in menu bar"))
     }
 
+    /// One-click control to completely turn off a provider (hides it from the
+    /// menu bar, sidebar, and overview and stops all background checks).
+    private func disableButton(_ tool: ToolID) -> some View {
+        Button(action: { appState.setToolEnabled(false, for: tool) }) {
+            Image(systemName: "power")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(DS.C.textMuted)
+                .opacity(0.65)
+        }
+        .buttonStyle(PressableButtonStyle())
+        .help("Turn off \(tool.displayName) — hide and stop all checks (re-enable anytime below or in Settings)")
+        .accessibilityLabel(Text("Turn off \(tool.displayName)"))
+    }
+
     private var historySection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Button(action: { historyExpanded.toggle() }) {
@@ -224,11 +425,8 @@ struct MainTabView: View {
     // MARK: - Last warm-up status card ("did it actually work?")
 
     private var outcomeTools: [ToolID] {
-        // Only show a row once an actual warm-up outcome exists. Mode is already
-        // visible in each provider row (its colored dot + status text), so the
-        // Auto-warm state no longer adds a card here — that previously made the
-        // panel grow/shrink on every mode toggle and jolt the scroll position.
-        ToolID.allCases.filter { tool in
+        // Only show a row once an actual warm-up outcome exists on an enabled tool.
+        appState.enabledTools.filter { tool in
             if case .none = appState.state(for: tool).lastWarmupOutcome { return false }
             return true
         }

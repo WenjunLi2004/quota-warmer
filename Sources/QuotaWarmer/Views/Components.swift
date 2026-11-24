@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // Reusable UI primitives shared across the in-app screens. Tuned to the
@@ -198,6 +199,11 @@ enum ToolStatusCopy {
             return "Claude needs reconnecting. Run claude auth login in Terminal, then Refresh."
         case .codex:
             return "Codex needs reconnecting. Sign in again, then Refresh."
+        case .antigravity:
+            if state.healthMessage.contains("agy CLI was not found") {
+                return "Antigravity isn't open and agy CLI wasn't found. Launch Antigravity or install agy, then Refresh."
+            }
+            return "Antigravity needs sign-in. Run agy in Terminal or open Antigravity, then Refresh."
         }
     }
 
@@ -377,3 +383,224 @@ struct PressableButtonStyle: ButtonStyle {
             .animation(.easeOut(duration: 0.10), value: configuration.isPressed)
     }
 }
+
+/// Canonical OpenUsage-style Antigravity quota slot ordering (`Gemini 5h`, `Gemini`, `Claude 5h`, `Claude`).
+enum AntigravityDisplaySlots {
+    static let defaultTitles: [String] = [
+        "Gemini 5h",
+        "Gemini",
+        "Claude 5h",
+        "Claude"
+    ]
+
+    static func windowDuration(for title: String, tool: ToolID = .antigravity) -> TimeInterval {
+        title.lowercased().contains("5h") ? tool.windowDuration : tool.weeklyWindowDuration
+    }
+}
+
+/// Shared compact token and API-value formatting matching OpenUsage (`6.2M tokens`, `915.8K`, `$4.12`).
+enum TokenFormatting {
+    private static let integerFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.maximumFractionDigits = 0
+        return formatter
+    }()
+
+    static func shortNumber(_ count: Int) -> String {
+        if count >= 999_950_000 {
+            return "\(trimmedTenths(Double(count) / 1_000_000_000))B"
+        }
+        if count >= 999_950 {
+            return "\(trimmedTenths(Double(count) / 1_000_000))M"
+        }
+        if count >= 1_000 {
+            return "\(trimmedTenths(Double(count) / 1_000))K"
+        }
+        return integerFormatter.string(from: NSNumber(value: count)) ?? "\(count)"
+    }
+
+    static func tokensLabel(_ count: Int) -> String {
+        "\(shortNumber(count)) tokens"
+    }
+
+    static func cost(_ value: Double?) -> String {
+        guard let value else { return "$--" }
+        return String(format: "$%.2f", value)
+    }
+
+    static func costAndTokens(costUSD: Double?, tokens: Int) -> String {
+        if let costUSD {
+            return "\(cost(costUSD)) · \(tokensLabel(tokens))"
+        }
+        return tokensLabel(tokens)
+    }
+
+    private static func trimmedTenths(_ value: Double) -> String {
+        let formatted = String(format: "%.1f", value)
+        return formatted.hasSuffix(".0") ? String(formatted.dropLast(2)) : formatted
+    }
+}
+
+/// OpenUsage-style token breakdown card (`Cache Read`, `Input`, `Output`, and `Top Models`)
+/// rendered directly inside the panel so it never triggers NSPanel key-resign dismissal.
+struct TokenBreakdownCard: View {
+    let title: String
+    let day: TokenUsageDay
+    var accent: Color = DS.C.blue
+
+    @State private var didCopy = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .center, spacing: 8) {
+                Text(title)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(DS.C.textSub)
+                if let costUSD = day.costUSD, day.totalTokens > 0 {
+                    Text(TokenFormatting.cost(costUSD))
+                        .font(DS.mono(10.5, weight: .medium))
+                        .foregroundStyle(DS.C.textMuted)
+                }
+                Spacer(minLength: 6)
+                Button(action: copyBreakdown) {
+                    Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(didCopy ? DS.C.green : DS.C.textSub)
+                        .frame(width: 24, height: 24)
+                        .background(DS.C.surfaceHigh, in: Circle())
+                        .overlay(Circle().stroke(DS.C.borderSoft, lineWidth: 1))
+                }
+                .buttonStyle(PressableButtonStyle())
+                .help("Copy token breakdown")
+                .accessibilityLabel(Text("Copy token breakdown"))
+            }
+
+            Text(TokenFormatting.tokensLabel(day.totalTokens))
+                .font(.system(size: 19, weight: .bold))
+                .foregroundStyle(DS.C.text)
+                .monospacedDigit()
+
+            segmentedBar
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 12) {
+                    legendItem(color: accent, label: "Cache Read", count: day.cachedInputTokens)
+                    Spacer(minLength: 6)
+                    legendItem(color: accent.opacity(0.32), label: "Output", count: day.outputTokens)
+                }
+                HStack(spacing: 12) {
+                    legendItem(color: accent.opacity(0.62), label: "Input", count: day.uncachedInputTokens)
+                    Spacer(minLength: 6)
+                }
+            }
+
+            if !day.topModels.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Top Models")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(DS.C.textMuted)
+                        .padding(.top, 2)
+                    ForEach(day.topModels) { item in
+                        HStack(spacing: 8) {
+                            Text(item.model)
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(DS.C.text)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 6)
+                            Text("\(Int((item.share * 100).rounded()))%")
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(DS.C.textSub)
+                                .monospacedDigit()
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
+        .background(DS.C.bg, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(DS.C.border, lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.08), radius: 8, x: 0, y: 3)
+    }
+
+    private var segmentedBar: some View {
+        let cached = max(0, day.cachedInputTokens)
+        let input = max(0, day.uncachedInputTokens)
+        let output = max(0, day.outputTokens)
+        let sum = cached + input + output
+        return GeometryReader { geo in
+            let w = geo.size.width
+            if sum > 0 {
+                HStack(spacing: 1.5) {
+                    if cached > 0 {
+                        Rectangle()
+                            .fill(accent)
+                            .frame(width: max(2, w * CGFloat(Double(cached) / Double(sum))))
+                    }
+                    if input > 0 {
+                        Rectangle()
+                            .fill(accent.opacity(0.62))
+                            .frame(width: max(2, w * CGFloat(Double(input) / Double(sum))))
+                    }
+                    if output > 0 {
+                        Rectangle()
+                            .fill(accent.opacity(0.32))
+                            .frame(width: max(2, w * CGFloat(Double(output) / Double(sum))))
+                    }
+                }
+                .frame(width: w, height: 6, alignment: .leading)
+                .clipShape(Capsule())
+            } else {
+                Capsule()
+                    .fill(DS.C.track)
+                    .frame(height: 6)
+            }
+        }
+        .frame(height: 6)
+    }
+
+    private func legendItem(color: Color, label: String, count: Int) -> some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(DS.C.textSub)
+                .lineLimit(1)
+            Text(TokenFormatting.shortNumber(count))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(DS.C.text)
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+    }
+
+    private func copyBreakdown() {
+        var lines: [String] = [
+            "\(title): \(TokenFormatting.tokensLabel(day.totalTokens))"
+        ]
+        if let costUSD = day.costUSD, day.totalTokens > 0 {
+            lines.append("Est. API Cost: \(TokenFormatting.cost(costUSD))")
+        }
+        lines.append("Cache Read: \(TokenFormatting.shortNumber(day.cachedInputTokens)) · Input: \(TokenFormatting.shortNumber(day.uncachedInputTokens)) · Output: \(TokenFormatting.shortNumber(day.outputTokens))")
+        if !day.topModels.isEmpty {
+            let modelsText = day.topModels
+                .map { "\($0.model) \(Int(($0.share * 100).rounded()))%" }
+                .joined(separator: ", ")
+            lines.append("Top Models: \(modelsText)")
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
+        didCopy = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            didCopy = false
+        }
+    }
+}
+
