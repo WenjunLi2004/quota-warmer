@@ -327,6 +327,17 @@ final class AppState: ObservableObject {
         ToolID.allCases.filter { !state(for: $0).isEnabled }
     }
 
+    /// Aggregated today token usage across all enabled providers for the Overview card.
+    var todayTokensSummary: TodayTokenTotalizer.Summary {
+        var summaries: [ToolID: TokenUsageSummary] = [:]
+        for tool in enabledTools {
+            if let summary = state(for: tool).tokenUsageSummary {
+                summaries[tool] = summary
+            }
+        }
+        return TodayTokenTotalizer.summarize(enabledTools: enabledTools, summaries: summaries)
+    }
+
     /// Actively turns an entire provider on or off. Turning off stops all
     /// timers, notifications, credential reads, and warmups and hides the
     /// provider from the menu bar, sidebar, and overview; turning it back on
@@ -352,6 +363,8 @@ final class AppState: ObservableObject {
             )
             if state.isMonitored {
                 Task { await refreshQuota(for: tool, allowAutomaticWarmup: state.isAutoWarmEnabled && !globalPassive) }
+            } else {
+                refreshTokenUsage(for: tool)
             }
             Task { await checkOnboarding() }
         } else {
@@ -435,6 +448,9 @@ final class AppState: ObservableObject {
 
     func refreshAllActivity(allowAutomaticWarmup: Bool = false, includeInactive: Bool = false) {
         isRefreshing = true
+        for tool in enabledTools {
+            refreshTokenUsage(for: tool)
+        }
         let tools = ToolID.allCases.filter {
             let st = state(for: $0)
             return st.isEnabled && (includeInactive || st.isMonitored)
@@ -615,15 +631,14 @@ final class AppState: ObservableObject {
         // refresh cycles can pile up overlapping disk scans.
         guard !state.isFetchingTokenUsage else { return }
         state.isFetchingTokenUsage = true
-        // The scan walks thousands of CLI JSONL log files synchronously; keep it
-        // off the main actor so the menu-bar panel never freezes (which also kept
-        // it from dismissing on outside clicks). A fresh provider per call avoids
-        // sharing the non-thread-safe date formatters across concurrent scans.
-        Task.detached(priority: .utility) {
-            let summary = LocalUsageProvider().usage(for: tool)
+        // Keep remote analytics + local JSONL log reconciliation off the main
+        // actor so the menu-bar panel never freezes.
+        Task.detached(priority: .utility) { [weak self] in
+            let summary = await LocalUsageProvider().usageAsync(for: tool)
             await MainActor.run {
                 state.tokenUsageSummary = summary
                 state.isFetchingTokenUsage = false
+                self?.objectWillChange.send()
             }
         }
     }

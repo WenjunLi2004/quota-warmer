@@ -6,12 +6,14 @@ struct MainTabView: View {
     // Session-only display state — never persisted, so every popover open
     // starts with both provider sections expanded (empty = nothing collapsed).
     @State private var collapsedTools: Set<ToolID> = []
+    @State private var expandedTodayTokenTool: ToolID? = nil
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 11) {
                 header
                 if !outcomeTools.isEmpty { statusCard }
+                if !appState.enabledTools.isEmpty { todayTokensCard }
                 providerList
                 historySection
             }
@@ -20,6 +22,92 @@ struct MainTabView: View {
             .padding(.bottom, 12)
         }
         .background(DS.C.bg)
+    }
+
+    private var todayTokensCard: some View {
+        let summary = appState.todayTokensSummary
+        let anyLoading = appState.enabledTools.contains { appState.state(for: $0).isFetchingTokenUsage }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Today's Tokens")
+                    .dsSectionLabel()
+                if anyLoading {
+                    Image(systemName: "hourglass")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(DS.C.textMuted)
+                }
+                Spacer(minLength: 6)
+                Text(TokenFormatting.costAndTokens(costUSD: summary.totalCostUSD, tokens: summary.totalTokens))
+                    .font(DS.mono(11.5, weight: .semibold))
+                    .foregroundStyle(DS.C.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+            }
+
+            if summary.totalTokens > 0 {
+                GeometryReader { geo in
+                    let w = geo.size.width
+                    HStack(spacing: 1.5) {
+                        ForEach(summary.entries.filter { $0.tokens > 0 }) { entry in
+                            Rectangle()
+                                .fill(DS.C.accent(entry.tool))
+                                .frame(width: max(3, w * CGFloat(entry.share)))
+                        }
+                    }
+                    .frame(width: w, height: 5, alignment: .leading)
+                    .clipShape(Capsule())
+                }
+                .frame(height: 5)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(summary.entries) { entry in
+                    let isSelected = expandedTodayTokenTool == entry.tool
+                    Button(action: {
+                        expandedTodayTokenTool = isSelected ? nil : entry.tool
+                    }) {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(DS.C.accent(entry.tool))
+                                .frame(width: 6, height: 6)
+                            Text(entry.tool.shortName)
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(DS.C.textSub)
+                                .lineLimit(1)
+                            Spacer(minLength: 6)
+                            Text(entry.day == nil ? "--" : TokenFormatting.costAndTokens(costUSD: entry.costUSD, tokens: entry.tokens))
+                                .font(DS.mono(10.5, weight: .semibold))
+                                .foregroundStyle(entry.day == nil ? DS.C.textMuted : DS.C.text)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
+                                .padding(.horizontal, isSelected ? 6 : 0)
+                                .padding(.vertical, isSelected ? 2 : 0)
+                                .background(
+                                    Capsule()
+                                        .fill(isSelected ? DS.C.surfaceHigh : Color.clear)
+                                )
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressableButtonStyle())
+                    .help("Click to inspect \(entry.tool.shortName) token breakdown")
+                }
+            }
+
+            if let selectedTool = expandedTodayTokenTool,
+               appState.state(for: selectedTool).isEnabled,
+               let day = appState.state(for: selectedTool).tokenUsageSummary?.today {
+                TokenBreakdownCard(
+                    title: "\(selectedTool.shortName) · Today",
+                    day: day,
+                    accent: DS.C.accent(selectedTool)
+                )
+                .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .dsCard()
     }
 
     private var header: some View {
@@ -179,11 +267,42 @@ struct MainTabView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                windowRow(state, title: "Session", metric: state.primaryMetric,
-                          resetAt: state.resetAt, windowDuration: tool.windowDuration,
-                          settling: state.sessionSettling)
-                windowRow(state, title: "Weekly", metric: state.weeklyMetric,
-                          resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+                if tool == .antigravity {
+                    if let metrics = state.quotaSnapshot?.displayMetrics, !metrics.isEmpty {
+                        ForEach(metrics) { metric in
+                            windowRow(
+                                state,
+                                title: metric.name,
+                                metric: metric,
+                                resetAt: metric.resetAt,
+                                windowDuration: metric.windowDurationSeconds
+                                    ?? AntigravityDisplaySlots.windowDuration(for: metric.name, tool: tool)
+                            )
+                        }
+                    } else if state.primaryMetric != nil || state.weeklyMetric != nil {
+                        windowRow(state, title: "Session", metric: state.primaryMetric,
+                                  resetAt: state.resetAt, windowDuration: tool.windowDuration,
+                                  settling: state.sessionSettling)
+                        windowRow(state, title: "Weekly", metric: state.weeklyMetric,
+                                  resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+                    } else {
+                        ForEach(AntigravityDisplaySlots.defaultTitles, id: \.self) { slotTitle in
+                            windowRow(
+                                state,
+                                title: slotTitle,
+                                metric: nil,
+                                resetAt: nil,
+                                windowDuration: AntigravityDisplaySlots.windowDuration(for: slotTitle, tool: tool)
+                            )
+                        }
+                    }
+                } else {
+                    windowRow(state, title: "Session", metric: state.primaryMetric,
+                              resetAt: state.resetAt, windowDuration: tool.windowDuration,
+                              settling: state.sessionSettling)
+                    windowRow(state, title: "Weekly", metric: state.weeklyMetric,
+                              resetAt: state.weeklyMetric?.resetAt, windowDuration: tool.weeklyWindowDuration)
+                }
             }
         }
         .padding(.horizontal, 12)

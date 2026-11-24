@@ -808,6 +808,7 @@ struct QuotaExtractorRegression {
         testAntigravityLocalUsageAndActivity()
         testSmartSchedulingAndAlertPolicies()
         testCodexTokenCountingAccuracyFixes()
+        testOpenUsageFourBarAndTokenAnalytics()
 
         let asyncDone = DispatchSemaphore(value: 0)
         Task.detached {
@@ -1689,4 +1690,175 @@ struct QuotaExtractorRegression {
         require(summary.today.outputTokens == 2_000, "Today output should equal 2,000, got \(summary.today.outputTokens)")
         requireClose(summary.today.costUSD, 0.4275, "Today Codex cost should normalize gpt-5.6 dated slug and apply >272K long-context pricing")
     }
+
+    private static func testOpenUsageFourBarAndTokenAnalytics() {
+        let quotaProvider = QuotaProvider()
+        let formatter = ISO8601DateFormatter()
+        let now = isoDate("2026-06-15T18:00:00Z")
+        let sReset = now.addingTimeInterval(3 * 3600)
+        let wReset = now.addingTimeInterval(5 * 86_400)
+
+        // 1. Standard 2-group Antigravity payload produces the exact 4 OpenUsage bars
+        //    ["Gemini 5h", "Gemini", "Claude 5h", "Claude"] on both Overview & ToolTabView.
+        let fourBarPayload: [String: Any] = [
+            "groups": [
+                [
+                    "name": "Claude and GPT-OSS",
+                    "buckets": [
+                        ["id": "3p-weekly", "window": "weekly", "remaining_fraction": 0.90, "reset_time": formatter.string(from: wReset)],
+                        ["id": "3p-5h", "window": "5h", "remaining_fraction": 0.95, "reset_time": formatter.string(from: sReset)]
+                    ]
+                ],
+                [
+                    "name": "Gemini Models",
+                    "buckets": [
+                        ["id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.80, "reset_time": formatter.string(from: wReset)],
+                        ["id": "gemini-5h", "window": "5h", "remaining_fraction": 0.85, "reset_time": formatter.string(from: sReset)]
+                    ]
+                ]
+            ]
+        ]
+        let fourBarSnap = quotaProvider.antigravitySnapshot(
+            payload: fourBarPayload,
+            source: "Antigravity CLI usage",
+            message: nil,
+            now: now
+        )
+        require(
+            fourBarSnap.displayMetrics.map(\.name) == ["Gemini 5h", "Gemini", "Claude 5h", "Claude"],
+            "Antigravity displayMetrics must emit canonical 4-bar OpenUsage order, got \(fourBarSnap.displayMetrics.map(\.name))"
+        )
+        requireClose(fourBarSnap.displayMetrics[0].remainingFraction, 0.85, "Gemini 5h remaining")
+        requireClose(fourBarSnap.displayMetrics[1].remainingFraction, 0.80, "Gemini weekly remaining")
+        requireClose(fourBarSnap.displayMetrics[2].remainingFraction, 0.95, "Claude 5h remaining")
+        requireClose(fourBarSnap.displayMetrics[3].remainingFraction, 0.90, "Claude weekly remaining")
+        require(fourBarSnap.displayMetrics[0].windowDurationSeconds == 5 * 3600, "Gemini 5h duration")
+        require(fourBarSnap.displayMetrics[1].windowDurationSeconds == 7 * 86_400, "Gemini weekly duration")
+
+        // 2. Views render displayMetrics on both Overview and ToolTabView, plus Today's Tokens card.
+        let mainViewSource = readSource("Sources/QuotaWarmer/Views/MainTabView.swift")
+        let toolViewSource = readSource("Sources/QuotaWarmer/Views/ToolTabView.swift")
+        require(
+            mainViewSource.contains("displayMetrics") && mainViewSource.contains("todayTokensCard"),
+            "MainTabView must render Antigravity 4-bar displayMetrics and cross-tool todayTokensCard"
+        )
+        require(
+            toolViewSource.contains("displayMetrics") && toolViewSource.contains("TokenBreakdownCard"),
+            "ToolTabView must render Antigravity 4-bar displayMetrics and OpenUsage-style TokenBreakdownCard"
+        )
+
+        // 3. Codex `wham/analytics/daily-workspace-usage-counts` parser matches OpenUsage 0.8+ exactly.
+        let analyticsJSON = """
+        {
+          "data": [
+            {
+              "date": "2026-06-14",
+              "totals": {
+                "turns": 42,
+                "uncached_text_input_tokens": 915800,
+                "cached_text_input_tokens": 5300000,
+                "text_output_tokens": 16400,
+                "text_total_tokens": 6232200
+              },
+              "models": [
+                {
+                  "model": "gpt-6-astra",
+                  "turns": 42,
+                  "text_total_tokens": 6232200
+                }
+              ]
+            },
+            {
+              "date": "2026-06-15",
+              "totals": {
+                "turns": 5,
+                "uncached_text_input_tokens": 100000,
+                "cached_text_input_tokens": 400000,
+                "text_output_tokens": 5000,
+                "text_total_tokens": 505000
+              },
+              "models": [
+                {
+                  "model": "gpt-6-astra",
+                  "turns": 5,
+                  "text_total_tokens": 505000
+                }
+              ]
+            }
+          ]
+        }
+        """
+        let localProvider = LocalUsageProvider(calendar: utcCalendar)
+        guard let remoteSummary = localProvider.codexRemoteSummary(data: Data(analyticsJSON.utf8), now: now) else {
+            fatalError("codexRemoteSummary should parse wham/analytics/daily-workspace-usage-counts JSON")
+        }
+        require(remoteSummary.yesterday.totalTokens == 6_232_200, "Yesterday Codex analytics total tokens")
+        require(remoteSummary.yesterday.cachedInputTokens == 5_300_000, "Yesterday Codex analytics Cache Read")
+        require(remoteSummary.yesterday.uncachedInputTokens == 915_800, "Yesterday Codex analytics Input")
+        require(remoteSummary.yesterday.outputTokens == 16_400, "Yesterday Codex analytics Output")
+        require(remoteSummary.yesterday.topModels == [ModelTokenShare(model: "gpt-6-astra", tokens: 6_232_200, share: 1.0)],
+                "Yesterday Codex analytics topModels should show gpt-6-astra 100%")
+        requireClose(remoteSummary.yesterday.costUSD, 15.278, "Yesterday gpt-6-astra API cost")
+        require(remoteSummary.today.totalTokens == 505_000, "Today Codex analytics total tokens")
+        require(remoteSummary.last30Days.totalTokens == 6_737_200, "30-day Codex analytics total tokens")
+
+        // 4. NSNull safety (`forked_from_id: null`, `model: null`) + `task_started.started_at` child replay gate.
+        let nsNullDir = temporaryDirectory("codex-nsnull-and-replay")
+        defer { try? FileManager.default.removeItem(at: nsNullDir) }
+        let sessDir = nsNullDir.appendingPathComponent("sessions", isDirectory: true)
+        createDirectory(sessDir)
+
+        // Root session with explicit JSON `null` values must NOT become `<null>` or `isForkOrSubagent == true`.
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"root_nulls","forked_from_id":null,"parent_thread_id":null,"source":null,"model":"gpt-6-astra"}}"#,
+            #"{"timestamp":"2026-06-15T10:00:05Z","type":"turn_context","payload":{"model":null}}"#,
+            #"{"timestamp":"2026-06-15T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"output_tokens":500,"total_tokens":10500},"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"output_tokens":500,"total_tokens":10500}}}}"#
+        ], to: sessDir.appendingPathComponent("rollout-2026-06-15-root-nulls.jsonl"))
+
+        // Child spawned at 2026-06-15T12:00:00Z (epoch 1781524800) replaying an >30d-old parent's
+        // `task_started` (started_at: 1775000000) + `turn_context` + `token_count`, then starting its own task!
+        let childSpawnEpoch = Int(isoDate("2026-06-15T12:00:00Z").timeIntervalSince1970)
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T12:00:00Z","type":"session_meta","payload":{"id":"child_1","forked_from_id":"ancient_parent","model":"gpt-6-astra"}}"#,
+            #"{"timestamp":"2026-06-15T12:00:00.050Z","type":"event_msg","payload":{"type":"task_started","started_at":1775000000}}"#,
+            #"{"timestamp":"2026-06-15T12:00:00.060Z","type":"turn_context","payload":{"model":"gpt-6-astra"}}"#,
+            #"{"timestamp":"2026-06-15T12:00:00.070Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":90000,"cached_input_tokens":80000,"output_tokens":1000,"total_tokens":91000},"total_token_usage":{"input_tokens":90000,"cached_input_tokens":80000,"output_tokens":1000,"total_tokens":91000}}}}"#,
+            "{\"timestamp\":\"2026-06-15T12:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"started_at\":\(childSpawnEpoch + 60)}}",
+            #"{"timestamp":"2026-06-15T12:01:10Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":4000,"cached_input_tokens":3000,"output_tokens":500,"total_tokens":4500},"total_token_usage":{"input_tokens":94000,"cached_input_tokens":83000,"output_tokens":1500,"total_tokens":95500}}}}"#
+        ], to: sessDir.appendingPathComponent("rollout-2026-06-15-child-replay.jsonl"))
+
+        let nullSafeSummary = localProvider.usage(for: .codex, baseURL: sessDir, now: now)
+        require(nullSafeSummary.today.totalTokens == 15_000,
+                "Root NSNull session (10,500) + child own task (4,500) must equal 15,000 without counting 91,000 parent replay, got \(nullSafeSummary.today.totalTokens)")
+        require(nullSafeSummary.today.topModels.first?.model == "gpt-6-astra",
+                "JSON null model field must not overwrite gpt-6-astra with <null>, got \(String(describing: nullSafeSummary.today.topModels))")
+
+        // 5. TodayTokenTotalizer aggregates Today tokens across enabled tools and excludes disabled Claude.
+        let claudeFakeSummary = TokenUsageSummary(
+            fetchedAt: now,
+            source: "Claude local usage",
+            today: TokenUsageDay(date: now, totalTokens: 999_999, costUSD: 9.99),
+            yesterday: TokenUsageDay(date: now, totalTokens: 0, costUSD: 0),
+            last30Days: TokenUsageDay(date: now, totalTokens: 999_999, costUSD: 9.99)
+        )
+        let agyFakeSummary = TokenUsageSummary(
+            fetchedAt: now,
+            source: "Antigravity local usage",
+            today: TokenUsageDay(date: now, totalTokens: 195_000, costUSD: 0.45),
+            yesterday: TokenUsageDay(date: now, totalTokens: 0, costUSD: 0),
+            last30Days: TokenUsageDay(date: now, totalTokens: 195_000, costUSD: 0.45)
+        )
+        let crossTool = TodayTokenTotalizer.summarize(
+            enabledTools: [.codex, .antigravity],
+            summaries: [
+                .claude: claudeFakeSummary,
+                .codex: remoteSummary,
+                .antigravity: agyFakeSummary
+            ]
+        )
+        require(crossTool.totalTokens == 700_000,
+                "TodayTokenTotalizer should sum enabled Codex (505K) + Antigravity (195K) = 700K and exclude disabled Claude, got \(crossTool.totalTokens)")
+        require(crossTool.entries.map(\.tool) == [.codex, .antigravity], "TodayTokenTotalizer entries should match enabledTools")
+    }
 }
+

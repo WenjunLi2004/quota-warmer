@@ -7,8 +7,15 @@ struct ToolTabView: View {
     let onRefresh: () -> Void
     var onDisable: (() -> Void)? = nil
 
+    private enum SpendPeriod: String {
+        case today = "Today"
+        case yesterday = "Yesterday"
+        case last30Days = "Last 30 Days"
+    }
+
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     @State private var now = Date()
+    @State private var selectedSpendPeriod: SpendPeriod? = nil
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -24,6 +31,7 @@ struct ToolTabView: View {
         }
         .background(DS.C.bg)
         .onReceive(ticker) { t in now = t }
+        .onChange(of: toolState.tool) { _, _ in selectedSpendPeriod = nil }
     }
 
     private var header: some View {
@@ -52,21 +60,60 @@ struct ToolTabView: View {
     }
 
     private var quotaList: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            windowRow(
-                title: "Session",
-                metric: toolState.primaryMetric,
-                resetAt: toolState.resetAt,
-                windowDuration: toolState.tool.windowDuration
-            )
-            windowRow(
-                title: "Weekly",
-                metric: toolState.weeklyMetric,
-                resetAt: toolState.weeklyMetric?.resetAt,
-                windowDuration: toolState.tool.weeklyWindowDuration
-            )
-            if let extras = toolState.quotaSnapshot?.extras, !extras.isEmpty {
-                extraPoolsSection(extras)
+        VStack(alignment: .leading, spacing: toolState.tool == .antigravity ? 16 : 22) {
+            if toolState.tool == .antigravity {
+                if let metrics = toolState.quotaSnapshot?.displayMetrics, !metrics.isEmpty {
+                    ForEach(metrics) { metric in
+                        windowRow(
+                            title: metric.name,
+                            metric: metric,
+                            resetAt: metric.resetAt,
+                            windowDuration: metric.windowDurationSeconds
+                                ?? AntigravityDisplaySlots.windowDuration(for: metric.name, tool: .antigravity)
+                        )
+                    }
+                } else if toolState.primaryMetric != nil || toolState.weeklyMetric != nil {
+                    windowRow(
+                        title: "Session",
+                        metric: toolState.primaryMetric,
+                        resetAt: toolState.resetAt,
+                        windowDuration: toolState.tool.windowDuration
+                    )
+                    windowRow(
+                        title: "Weekly",
+                        metric: toolState.weeklyMetric,
+                        resetAt: toolState.weeklyMetric?.resetAt,
+                        windowDuration: toolState.tool.weeklyWindowDuration
+                    )
+                    if let extras = toolState.quotaSnapshot?.extras, !extras.isEmpty {
+                        extraPoolsSection(extras)
+                    }
+                } else {
+                    ForEach(AntigravityDisplaySlots.defaultTitles, id: \.self) { slotTitle in
+                        windowRow(
+                            title: slotTitle,
+                            metric: nil,
+                            resetAt: nil,
+                            windowDuration: AntigravityDisplaySlots.windowDuration(for: slotTitle, tool: .antigravity)
+                        )
+                    }
+                }
+            } else {
+                windowRow(
+                    title: "Session",
+                    metric: toolState.primaryMetric,
+                    resetAt: toolState.resetAt,
+                    windowDuration: toolState.tool.windowDuration
+                )
+                windowRow(
+                    title: "Weekly",
+                    metric: toolState.weeklyMetric,
+                    resetAt: toolState.weeklyMetric?.resetAt,
+                    windowDuration: toolState.tool.weeklyWindowDuration
+                )
+                if let extras = toolState.quotaSnapshot?.extras, !extras.isEmpty {
+                    extraPoolsSection(extras)
+                }
             }
             tokenUsageSection
             if let issue = ToolStatusCopy.providerIssue(for: toolState) {
@@ -135,19 +182,41 @@ struct ToolTabView: View {
                         .foregroundStyle(DS.C.textMuted)
                 }
             }
-            VStack(alignment: .leading, spacing: 6) {
-                tokenUsageRow("Today", usage: toolState.tokenUsageSummary?.today, showBreakdownInline: true)
-                tokenUsageRow("Yesterday", usage: toolState.tokenUsageSummary?.yesterday)
-                tokenUsageRow("Last 30 Days", usage: toolState.tokenUsageSummary?.last30Days)
+            VStack(alignment: .leading, spacing: 5) {
+                tokenUsageRow(.today, usage: toolState.tokenUsageSummary?.today)
+                tokenUsageRow(.yesterday, usage: toolState.tokenUsageSummary?.yesterday)
+                tokenUsageRow(.last30Days, usage: toolState.tokenUsageSummary?.last30Days)
+            }
+            if let period = selectedSpendPeriod,
+               let day = usageDay(for: period) {
+                TokenBreakdownCard(
+                    title: period.rawValue,
+                    day: day,
+                    accent: DS.C.accent(toolState.tool)
+                )
+                .padding(.top, 2)
             }
         }
     }
 
-    private func tokenUsageRow(_ title: String, usage: TokenUsageDay?, showBreakdownInline: Bool = false) -> some View {
+    private func usageDay(for period: SpendPeriod) -> TokenUsageDay? {
+        guard let summary = toolState.tokenUsageSummary else { return nil }
+        switch period {
+        case .today:      return summary.today
+        case .yesterday:  return summary.yesterday
+        case .last30Days: return summary.last30Days
+        }
+    }
+
+    private func tokenUsageRow(_ period: SpendPeriod, usage: TokenUsageDay?) -> some View {
+        let isSelected = selectedSpendPeriod == period
         let breakdown = tokenBreakdownText(usage)
-        return VStack(alignment: .trailing, spacing: 2) {
+        return Button(action: {
+            guard usage != nil else { return }
+            selectedSpendPeriod = isSelected ? nil : period
+        }) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text(title)
+                Text(period.rawValue)
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(DS.C.textSub)
                     .lineLimit(1)
@@ -157,16 +226,17 @@ struct ToolTabView: View {
                     .foregroundStyle(usage == nil ? DS.C.textMuted : DS.C.text)
                     .lineLimit(1)
                     .minimumScaleFactor(0.74)
+                    .padding(.horizontal, isSelected ? 7 : 0)
+                    .padding(.vertical, isSelected ? 2 : 0)
+                    .background(
+                        Capsule()
+                            .fill(isSelected ? DS.C.surfaceHigh : Color.clear)
+                    )
             }
-            if showBreakdownInline, let breakdown {
-                Text(breakdown)
-                    .font(DS.mono(9.5, weight: .regular))
-                    .foregroundStyle(DS.C.textMuted)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-            }
+            .contentShape(Rectangle())
         }
-        .help(breakdown ?? "")
+        .buttonStyle(PressableButtonStyle())
+        .help(breakdown ?? "Click to inspect token breakdown")
     }
 
     private func tokenBreakdownText(_ usage: TokenUsageDay?) -> String? {
@@ -174,47 +244,12 @@ struct ToolTabView: View {
         guard usage.uncachedInputTokens > 0 || usage.cachedInputTokens > 0 || usage.outputTokens > 0 else {
             return nil
         }
-        return "New in \(shortTokenNumber(usage.uncachedInputTokens)) · Cached \(shortTokenNumber(usage.cachedInputTokens)) · Out \(shortTokenNumber(usage.outputTokens))"
+        return "Cache Read \(TokenFormatting.shortNumber(usage.cachedInputTokens)) · Input \(TokenFormatting.shortNumber(usage.uncachedInputTokens)) · Output \(TokenFormatting.shortNumber(usage.outputTokens))"
     }
 
     private func tokenUsageValue(_ usage: TokenUsageDay?) -> String {
         guard let usage else { return "--" }
-        return "\(formatCost(usage.costUSD)) · \(formatTokenCount(usage.totalTokens))"
-    }
-
-    private func formatCost(_ value: Double?) -> String {
-        guard let value else { return "$--" }
-        return String(format: "$%.2f", value)
-    }
-
-    private func shortTokenNumber(_ count: Int) -> String {
-        if count >= 1_000_000_000 {
-            return "\(compactCount(count, divisor: 1_000_000_000))B"
-        }
-        if count >= 1_000_000 {
-            return "\(compactCount(count, divisor: 1_000_000))M"
-        }
-        if count >= 1_000 {
-            return "\(compactCount(count, divisor: 1_000))K"
-        }
-        return Self.integerFormatter.string(from: NSNumber(value: count)) ?? "\(count)"
-    }
-
-    private func formatTokenCount(_ count: Int) -> String {
-        "\(shortTokenNumber(count)) tokens"
-    }
-
-    private func compactCount(_ count: Int, divisor: Double) -> String {
-        let scaled = Double(count) / divisor
-        if scaled >= 10 {
-            return "\(Int(scaled.rounded()))"
-        }
-        return trimmed(scaled)
-    }
-
-    private func trimmed(_ value: Double) -> String {
-        let formatted = String(format: "%.1f", value)
-        return formatted.hasSuffix(".0") ? String(formatted.dropLast(2)) : formatted
+        return "\(TokenFormatting.cost(usage.costUSD)) · \(TokenFormatting.tokensLabel(usage.totalTokens))"
     }
 
     private func fallbackResetText(metric: QuotaMetric?) -> String {
@@ -224,13 +259,6 @@ struct ToolTabView: View {
     private var activeControl: some View {
         ToolModeMenu(mode: toolState.mode) { onSetMode($0) }
     }
-
-    private static let integerFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.maximumFractionDigits = 0
-        return formatter
-    }()
 
     private var actions: some View {
         HStack(spacing: 8) {

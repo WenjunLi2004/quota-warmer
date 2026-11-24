@@ -204,6 +204,7 @@ struct QuotaMetric: Identifiable {
     /// synthesized from Claude's null `five_hour` slot. It is claimable by an
     /// opted-in auto-warm, but must not count as already opened or confirmed.
     let isIdle: Bool
+    let windowDurationSeconds: TimeInterval?
 
     init(
         name: String,
@@ -212,7 +213,8 @@ struct QuotaMetric: Identifiable {
         resetAt: Date?,
         detail: String?,
         context: String = "",
-        isIdle: Bool = false
+        isIdle: Bool = false,
+        windowDurationSeconds: TimeInterval? = nil
     ) {
         self.name = name
         self.usedPercent = usedPercent
@@ -221,6 +223,7 @@ struct QuotaMetric: Identifiable {
         self.detail = detail
         self.context = context
         self.isIdle = isIdle
+        self.windowDurationSeconds = windowDurationSeconds
     }
 
     var clampedUsed: Double {
@@ -235,8 +238,19 @@ struct QuotaMetric: Identifiable {
     }
 
     var isIdleFiveHourWindow: Bool {
-        isIdle && name.lowercased().contains("5h")
+        if !isIdle { return false }
+        if name.lowercased().contains("5h") { return true }
+        if let dur = windowDurationSeconds, dur > 0, dur <= 6 * 3600 { return true }
+        return false
     }
+}
+
+struct ModelTokenShare: Identifiable, Equatable {
+    let model: String
+    let tokens: Int
+    let share: Double
+
+    var id: String { model }
 }
 
 struct TokenUsageDay: Identifiable, Equatable {
@@ -246,6 +260,7 @@ struct TokenUsageDay: Identifiable, Equatable {
     let uncachedInputTokens: Int
     let cachedInputTokens: Int
     let outputTokens: Int
+    let topModels: [ModelTokenShare]
 
     init(
         date: Date,
@@ -253,7 +268,8 @@ struct TokenUsageDay: Identifiable, Equatable {
         costUSD: Double?,
         uncachedInputTokens: Int = 0,
         cachedInputTokens: Int = 0,
-        outputTokens: Int = 0
+        outputTokens: Int = 0,
+        topModels: [ModelTokenShare] = []
     ) {
         self.date = date
         self.totalTokens = totalTokens
@@ -261,6 +277,7 @@ struct TokenUsageDay: Identifiable, Equatable {
         self.uncachedInputTokens = uncachedInputTokens
         self.cachedInputTokens = cachedInputTokens
         self.outputTokens = outputTokens
+        self.topModels = topModels
     }
 
     var id: Date { date }
@@ -288,6 +305,31 @@ struct QuotaSnapshot {
     let extras: [QuotaMetric]
     let rawWindowKey: String
     let message: String?
+    let displayMetrics: [QuotaMetric]
+
+    init(
+        tool: ToolID,
+        fetchedAt: Date,
+        primarySource: String,
+        corroboratingSource: String?,
+        fiveHour: QuotaMetric?,
+        weekly: QuotaMetric?,
+        extras: [QuotaMetric],
+        rawWindowKey: String,
+        message: String?,
+        displayMetrics: [QuotaMetric] = []
+    ) {
+        self.tool = tool
+        self.fetchedAt = fetchedAt
+        self.primarySource = primarySource
+        self.corroboratingSource = corroboratingSource
+        self.fiveHour = fiveHour
+        self.weekly = weekly
+        self.extras = extras
+        self.rawWindowKey = rawWindowKey
+        self.message = message
+        self.displayMetrics = displayMetrics
+    }
 
     func freshness(now: Date = Date()) -> QuotaFreshness {
         let age = now.timeIntervalSince(fetchedAt)
@@ -535,5 +577,56 @@ enum LowQuotaAlertPolicy {
             return nil
         }
         return key
+    }
+}
+
+/// Aggregates today's token counts and estimated API value across enabled providers.
+enum TodayTokenTotalizer {
+    struct Entry: Identifiable, Equatable {
+        let tool: ToolID
+        let tokens: Int
+        let costUSD: Double?
+        let share: Double
+        let day: TokenUsageDay?
+
+        var id: ToolID { tool }
+    }
+
+    struct Summary: Equatable {
+        let totalTokens: Int
+        let totalCostUSD: Double?
+        let entries: [Entry]
+    }
+
+    static func summarize(
+        enabledTools: [ToolID],
+        summaries: [ToolID: TokenUsageSummary]
+    ) -> Summary {
+        let rawEntries: [(tool: ToolID, day: TokenUsageDay?)] = enabledTools.map { tool in
+            (tool, summaries[tool]?.today)
+        }
+        let grandTotal = rawEntries.reduce(0) { $0 + ($1.day?.totalTokens ?? 0) }
+        var totalCost: Double?
+        for (_, day) in rawEntries {
+            if let cost = day?.costUSD {
+                totalCost = (totalCost ?? 0) + cost
+            }
+        }
+        let entries = rawEntries.map { item -> Entry in
+            let tokens = item.day?.totalTokens ?? 0
+            let share = grandTotal > 0 ? Double(tokens) / Double(grandTotal) : 0
+            return Entry(
+                tool: item.tool,
+                tokens: tokens,
+                costUSD: item.day?.costUSD,
+                share: share,
+                day: item.day
+            )
+        }
+        return Summary(
+            totalTokens: grandTotal,
+            totalCostUSD: totalCost ?? (grandTotal == 0 ? 0 : nil),
+            entries: entries
+        )
     }
 }

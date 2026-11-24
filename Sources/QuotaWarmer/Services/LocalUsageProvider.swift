@@ -1,4 +1,10 @@
 import Foundation
+#if canImport(CoreFoundation)
+import CoreFoundation
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 final class LocalUsageProvider {
     private struct UsageRecord {
@@ -22,20 +28,38 @@ final class LocalUsageProvider {
         var cachedInput = 0
         var output = 0
         var costUSD: Double?
+        var byModel: [String: Int] = [:]
 
         mutating func add(
             tokens: Int,
             uncachedInput: Int = 0,
             cachedInput: Int = 0,
             output: Int = 0,
-            cost: Double?
+            cost: Double?,
+            model: String? = nil
         ) {
             self.tokens += tokens
             self.uncachedInput += uncachedInput
             self.cachedInput += cachedInput
             self.output += output
+            if let model, !model.isEmpty, tokens > 0 {
+                self.byModel[model, default: 0] += tokens
+            }
             guard let cost else { return }
             self.costUSD = (self.costUSD ?? 0) + cost
+        }
+
+        mutating func merge(_ other: UsageBucket) {
+            self.tokens += other.tokens
+            self.uncachedInput += other.uncachedInput
+            self.cachedInput += other.cachedInput
+            self.output += other.output
+            for (model, count) in other.byModel {
+                self.byModel[model, default: 0] += count
+            }
+            if let otherCost = other.costUSD {
+                self.costUSD = (self.costUSD ?? 0) + otherCost
+            }
         }
     }
 
@@ -107,6 +131,8 @@ final class LocalUsageProvider {
         let events: [CodexCandidateEvent]
     }
 
+    private static let codexRemoteCache = CodexRemoteUsageCache()
+
     private let fileManager: FileManager
     private let calendar: Calendar
 
@@ -122,9 +148,246 @@ final class LocalUsageProvider {
         return formatter
     }()
 
+    private static var utcCalendar: Calendar {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 0)!
+        return cal
+    }
+
     init(fileManager: FileManager = .default, calendar: Calendar = .current) {
         self.fileManager = fileManager
         self.calendar = calendar
+    }
+
+    /// Asynchronous token usage lookup. For Codex, queries OpenAI's official
+    /// `wham/analytics/daily-workspace-usage-counts` endpoint (matching OpenUsage)
+    /// and reconciles/falls back to local rollout logs when offline or mid-turn.
+    func usageAsync(
+        for tool: ToolID,
+        credentialStore: CredentialStore = CredentialStore(),
+        session: URLSession = .shared,
+        now: Date = Date()
+    ) async -> TokenUsageSummary {
+        if tool == .codex {
+            if let remote = await fetchCodexRemoteSummary(
+                credentialStore: credentialStore,
+                session: session,
+                now: now
+            ) {
+                let localUTC = LocalUsageProvider(fileManager: fileManager, calendar: Self.utcCalendar)
+                    .usage(for: .codex, now: now)
+                if localUTC.today.totalTokens > remote.today.totalTokens {
+                    let deltaTokens = localUTC.today.totalTokens - remote.today.totalTokens
+                    let deltaCost: Double?
+                    if let lCost = localUTC.today.costUSD {
+                        deltaCost = max(0, lCost - (remote.today.costUSD ?? 0))
+                    } else {
+                        deltaCost = nil
+                    }
+                    let mergedLast30Cost: Double?
+                    if let r30 = remote.last30Days.costUSD, let dCost = deltaCost {
+                        mergedLast30Cost = r30 + dCost
+                    } else {
+                        mergedLast30Cost = remote.last30Days.costUSD ?? deltaCost
+                    }
+                    let mergedLast30 = TokenUsageDay(
+                        date: remote.last30Days.date,
+                        totalTokens: remote.last30Days.totalTokens + deltaTokens,
+                        costUSD: mergedLast30Cost,
+                        uncachedInputTokens: remote.last30Days.uncachedInputTokens + max(0, localUTC.today.uncachedInputTokens - remote.today.uncachedInputTokens),
+                        cachedInputTokens: remote.last30Days.cachedInputTokens + max(0, localUTC.today.cachedInputTokens - remote.today.cachedInputTokens),
+                        outputTokens: remote.last30Days.outputTokens + max(0, localUTC.today.outputTokens - remote.today.outputTokens),
+                        topModels: remote.last30Days.topModels.isEmpty ? localUTC.today.topModels : remote.last30Days.topModels
+                    )
+                    return TokenUsageSummary(
+                        fetchedAt: now,
+                        source: remote.source,
+                        today: localUTC.today,
+                        yesterday: remote.yesterday,
+                        last30Days: mergedLast30
+                    )
+                }
+                return remote
+            }
+        }
+        return usage(for: tool, now: now)
+    }
+
+    private func fetchCodexRemoteSummary(
+        credentialStore: CredentialStore,
+        session: URLSession,
+        now: Date
+    ) async -> TokenUsageSummary? {
+        guard let credential = try? await credentialStore.credential(for: .codex),
+              !credential.accessToken.isEmpty else {
+            return nil
+        }
+        let cacheKey = credential.accountID ?? String(credential.accessToken.prefix(16))
+        if let cached = await Self.codexRemoteCache.cachedSummary(for: cacheKey, now: now) {
+            return cached
+        }
+        if await Self.codexRemoteCache.isBackedOff(for: cacheKey, now: now) {
+            return nil
+        }
+
+        let utc = Self.utcCalendar
+        let today = utc.startOfDay(for: now)
+        let since = utc.date(byAdding: .day, value: -30, to: today) ?? today
+        let startStr = Self.utcDateString(since)
+        let endStr = Self.utcDateString(today)
+
+        var comps = URLComponents(string: "https://chatgpt.com/backend-api/wham/analytics/daily-workspace-usage-counts")!
+        comps.queryItems = [
+            URLQueryItem(name: "start_date", value: startStr),
+            URLQueryItem(name: "end_date", value: endStr),
+            URLQueryItem(name: "group_by", value: "day"),
+            URLQueryItem(name: "workspace_user", value: "true")
+        ]
+        guard let url = comps.url else { return nil }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 12
+        req.setValue("Bearer \(credential.accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let accountID = credential.accountID, !accountID.isEmpty {
+            req.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+
+        guard let (data, response) = try? await session.data(for: req),
+              let http = response as? HTTPURLResponse else {
+            return nil
+        }
+        if http.statusCode == 429 {
+            let retry = Double(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 1800
+            await Self.codexRemoteCache.recordBackoff(for: cacheKey, seconds: retry, now: now)
+            return nil
+        }
+        guard (200..<300).contains(http.statusCode),
+              let parsed = codexRemoteSummary(data: data, now: now) else {
+            return nil
+        }
+        await Self.codexRemoteCache.store(summary: parsed, for: cacheKey, now: now)
+        return parsed
+    }
+
+    /// Parses ChatGPT's `wham/analytics/daily-workspace-usage-counts` JSON report
+    /// (UTC `yyyy-MM-dd` records with `totals` and `models[]`, matching OpenUsage 0.8+).
+    func codexRemoteSummary(data: Data, now: Date = Date()) -> TokenUsageSummary? {
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let records = root["data"] as? [[String: Any]] else {
+            return nil
+        }
+
+        let utc = Self.utcCalendar
+        let today = utc.startOfDay(for: now)
+        let yesterday = utc.date(byAdding: .day, value: -1, to: today) ?? today
+        let since = utc.date(byAdding: .day, value: -30, to: today) ?? today
+
+        let todayKey = Self.utcDateString(today)
+        let yesterdayKey = Self.utcDateString(yesterday)
+        let sinceKey = Self.utcDateString(since)
+
+        var bucketsByDayKey: [String: UsageBucket] = [:]
+        for record in records {
+            guard let rawDate = stringValue(record["date"]), rawDate.count >= 10,
+                  let totals = record["totals"] as? [String: Any] else {
+                continue
+            }
+            let dayKey = String(rawDate.prefix(10))
+            let uncached = max(0, intValue(totals["uncached_text_input_tokens"]))
+            let cached = max(0, intValue(totals["cached_text_input_tokens"]))
+            let output = max(0, intValue(totals["text_output_tokens"]))
+            let explicitTotal = max(0, intValue(totals["text_total_tokens"]))
+            let resolvedTotal = explicitTotal > 0 ? explicitTotal : (uncached + cached + output)
+
+            var modelTokens: [String: Int] = [:]
+            if let models = record["models"] as? [[String: Any]] {
+                for m in models {
+                    let rawName = stringValue(m["model"]) ?? "unknown"
+                    let mTok = max(0, intValue(m["text_total_tokens"]))
+                    let mTurns = max(0, intValue(m["turns"]))
+                    if mTok > 0 {
+                        modelTokens[rawName, default: 0] += mTok
+                    } else if mTurns > 0, resolvedTotal > 0 {
+                        modelTokens[rawName, default: 0] += mTurns
+                    }
+                }
+            }
+
+            let estimatedCost = estimateCodexDayCost(
+                uncachedInput: uncached,
+                cachedInput: cached,
+                output: output,
+                totalTokens: resolvedTotal,
+                modelWeights: modelTokens
+            )
+
+            var dayBucket = bucketsByDayKey[dayKey] ?? UsageBucket()
+            dayBucket.tokens += resolvedTotal
+            dayBucket.uncachedInput += uncached
+            dayBucket.cachedInput += cached
+            dayBucket.output += output
+            if let estimatedCost {
+                dayBucket.costUSD = (dayBucket.costUSD ?? 0) + estimatedCost
+            }
+            let weightSum = modelTokens.values.reduce(0, +)
+            if weightSum > 0, resolvedTotal > 0 {
+                for (mName, w) in modelTokens {
+                    let attributed = Int((Double(resolvedTotal) * (Double(w) / Double(weightSum))).rounded())
+                    if attributed > 0 {
+                        dayBucket.byModel[mName, default: 0] += attributed
+                    }
+                }
+            }
+            bucketsByDayKey[dayKey] = dayBucket
+        }
+
+        let todayBucket = bucketsByDayKey[todayKey] ?? UsageBucket()
+        let yesterdayBucket = bucketsByDayKey[yesterdayKey] ?? UsageBucket()
+        let last30Bucket = bucketsByDayKey
+            .filter { $0.key >= sinceKey && $0.key <= todayKey }
+            .reduce(into: UsageBucket()) { agg, item in agg.merge(item.value) }
+
+        return TokenUsageSummary(
+            fetchedAt: now,
+            source: "Codex analytics",
+            today: makeDay(date: today, bucket: todayBucket),
+            yesterday: makeDay(date: yesterday, bucket: yesterdayBucket),
+            last30Days: makeDay(date: since, bucket: last30Bucket)
+        )
+    }
+
+    private func estimateCodexDayCost(
+        uncachedInput: Int,
+        cachedInput: Int,
+        output: Int,
+        totalTokens: Int,
+        modelWeights: [String: Int]
+    ) -> Double? {
+        guard totalTokens > 0 else { return 0 }
+        let weightSum = modelWeights.values.reduce(0, +)
+        guard weightSum > 0 else { return nil }
+
+        var totalCost: Double = 0
+        var pricedAny = false
+        for (modelName, weight) in modelWeights where weight > 0 {
+            guard let tier = codexPricingTier(for: modelName) else { continue }
+            pricedAny = true
+            let fraction = Double(weight) / Double(weightSum)
+            let partUncached = Double(uncachedInput) * fraction
+            let partCached = Double(cachedInput) * fraction
+            let partOutput = Double(output) * fraction
+            totalCost += ((partUncached * tier.input)
+                + (partCached * tier.cacheRead)
+                + (partOutput * tier.output)) / 1_000_000
+        }
+        return pricedAny ? totalCost : nil
+    }
+
+    private static func utcDateString(_ date: Date) -> String {
+        let comps = utcCalendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", comps.year ?? 1970, comps.month ?? 1, comps.day ?? 1)
     }
 
     func usage(for tool: ToolID, baseURL: URL? = nil, now: Date = Date()) -> TokenUsageSummary {
@@ -154,13 +417,7 @@ final class LocalUsageProvider {
         let last30Bucket = buckets
             .filter { $0.key >= since && $0.key <= today }
             .reduce(into: UsageBucket()) { aggregate, entry in
-                aggregate.add(
-                    tokens: entry.value.tokens,
-                    uncachedInput: entry.value.uncachedInput,
-                    cachedInput: entry.value.cachedInput,
-                    output: entry.value.output,
-                    cost: entry.value.costUSD
-                )
+                aggregate.merge(entry.value)
             }
 
         let sourceLabel: String
@@ -181,13 +438,28 @@ final class LocalUsageProvider {
 
     private func makeDay(date: Date, bucket: UsageBucket) -> TokenUsageDay {
         let resolvedCost: Double? = bucket.costUSD ?? (bucket.tokens == 0 ? 0 : nil)
+        let modelSum = max(1, bucket.byModel.values.reduce(0, +))
+        let topModels: [ModelTokenShare] = bucket.byModel
+            .sorted { lhs, rhs in
+                if lhs.value != rhs.value { return lhs.value > rhs.value }
+                return lhs.key < rhs.key
+            }
+            .prefix(5)
+            .map { entry in
+                ModelTokenShare(
+                    model: entry.key,
+                    tokens: entry.value,
+                    share: min(1, max(0, Double(entry.value) / Double(modelSum)))
+                )
+            }
         return TokenUsageDay(
             date: date,
             totalTokens: bucket.tokens,
             costUSD: resolvedCost,
             uncachedInputTokens: bucket.uncachedInput,
             cachedInputTokens: bucket.cachedInput,
-            outputTokens: bucket.output
+            outputTokens: bucket.output,
+            topModels: topModels
         )
     }
 
@@ -292,7 +564,10 @@ final class LocalUsageProvider {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         var currentModel: String?
         var sessionId: String?
+        var sawPrimarySessionMeta = false
         var isForkOrSubagent = false
+        var childCreatedEpoch: TimeInterval?
+        var inReplayedParentTask = false
         var sawTurnContext = false
         var prevTotal: CodexTotals?
         var ledgerThreadTotals = Set<CodexTotals>()
@@ -309,24 +584,39 @@ final class LocalUsageProvider {
 
             if topType == "session_meta" || payloadType == "session_meta" {
                 let meta = payload ?? object
-                if sessionId == nil {
+                if !sawPrimarySessionMeta {
+                    sawPrimarySessionMeta = true
                     sessionId = stringValue(meta["id"] ?? meta["session_id"] ?? meta["thread_id"])
-                }
-                if meta["forked_from_id"] != nil
-                    || meta["parent_thread_id"] != nil
-                    || isSubagentSource(meta["source"]) {
-                    isForkOrSubagent = true
+                    if stringValue(meta["forked_from_id"]) != nil
+                        || stringValue(meta["parent_thread_id"]) != nil
+                        || isSubagentSource(meta["source"]) {
+                        isForkOrSubagent = true
+                        childCreatedEpoch = (stringValue(meta["timestamp"]) ?? stringValue(object["timestamp"]))
+                            .flatMap(parseDate)?.timeIntervalSince1970
+                    }
                 }
                 continue
             }
 
-            if topType == "turn_context" || payloadType == "turn_context" {
+            if payloadType == "task_started" {
+                if isForkOrSubagent,
+                   let createdEpoch = childCreatedEpoch,
+                   let rawStarted = payload?["started_at"],
+                   let startedEpoch = epochSeconds(from: rawStarted) {
+                    if startedEpoch < createdEpoch - 1.0 {
+                        inReplayedParentTask = true
+                        continue
+                    }
+                }
+                inReplayedParentTask = false
                 sawTurnContext = true
                 continue
             }
 
-            if payloadType == "user_message" || payloadType == "task_started" {
-                sawTurnContext = true
+            if topType == "turn_context" || payloadType == "turn_context" || payloadType == "user_message" {
+                if !inReplayedParentTask {
+                    sawTurnContext = true
+                }
                 continue
             }
 
@@ -339,6 +629,7 @@ final class LocalUsageProvider {
                     ledgerThreadTotals.insert(threadTotal)
                     prevTotal = threadTotal
                 }
+                if inReplayedParentTask { continue }
                 guard let recordDate = date(from: object), recordDate >= since else { continue }
                 let rowModel = stringValue(payload["model"]) ?? currentModel
                 let input = intValue(usageDict["input_tokens"])
@@ -395,6 +686,7 @@ final class LocalUsageProvider {
 
                 let priorTotal = prevTotal
                 if let total { prevTotal = total }
+                if inReplayedParentTask { continue }
 
                 let input: Int
                 let cached: Int
@@ -497,6 +789,17 @@ final class LocalUsageProvider {
         )
     }
 
+    private func epochSeconds(from raw: Any) -> TimeInterval? {
+        if raw is NSNull { return nil }
+        if let str = raw as? String, let parsed = parseDate(str) {
+            return parsed.timeIntervalSince1970
+        }
+        if let val = doubleValue(raw), val > 0 {
+            return val > 10_000_000_000 ? val / 1000 : val
+        }
+        return nil
+    }
+
     private func parseCodexTotals(_ usage: [String: Any]) -> CodexTotals {
         let input = intValue(usage["input_tokens"])
         let cached = max(intValue(usage["cached_input_tokens"]), intValue(usage["cache_read_input_tokens"]))
@@ -507,14 +810,14 @@ final class LocalUsageProvider {
     }
 
     private func isSubagentSource(_ source: Any?) -> Bool {
-        guard let source else { return false }
+        guard let source, !(source is NSNull) else { return false }
         if let str = source as? String {
             let lower = str.lowercased()
             return lower.contains("subagent") || lower.contains("thread_spawn") || lower.contains("fork")
         }
         if let dict = source as? [String: Any] {
-            if dict["subagent"] != nil || dict["thread_spawn"] != nil { return true }
-            if let sub = dict["subagent"] as? [String: Any], sub["thread_spawn"] != nil { return true }
+            if let sub = dict["subagent"], !(sub is NSNull) { return true }
+            if let spawn = dict["thread_spawn"], !(spawn is NSNull) { return true }
         }
         return false
     }
@@ -648,12 +951,19 @@ final class LocalUsageProvider {
         records.reduce(into: [Date: UsageBucket]()) { buckets, record in
             let day = calendar.startOfDay(for: record.date)
             let cost = record.explicitCostUSD ?? pricing(record)
+            let cleanModel = record.model.map { raw -> String in
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.lowercased().hasPrefix("openai/")
+                    ? String(trimmed.dropFirst("openai/".count))
+                    : trimmed
+            }
             buckets[day, default: UsageBucket()].add(
                 tokens: record.totalTokens,
                 uncachedInput: record.uncachedInput,
                 cachedInput: record.cachedInput,
                 output: record.outputTokens,
-                cost: cost
+                cost: cost,
+                model: cleanModel
             )
         }
     }
@@ -998,7 +1308,12 @@ final class LocalUsageProvider {
     }
 
     private func intValue(_ value: Any?) -> Int {
-        if let number = value as? NSNumber { return number.intValue }
+        guard let value, !(value is NSNull) else { return 0 }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return 0 }
+            return number.intValue
+        }
+        if value is Bool { return 0 }
         if let int = value as? Int { return int }
         if let double = value as? Double { return Int(double) }
         if let string = value as? String, let double = Double(string) { return Int(double) }
@@ -1006,7 +1321,12 @@ final class LocalUsageProvider {
     }
 
     private func doubleValue(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber { return number.doubleValue }
+        guard let value, !(value is NSNull) else { return nil }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+            return number.doubleValue
+        }
+        if value is Bool { return nil }
         if let double = value as? Double { return double }
         if let int = value as? Int { return Double(int) }
         if let string = value as? String { return Double(string) }
@@ -1014,8 +1334,55 @@ final class LocalUsageProvider {
     }
 
     private func stringValue(_ value: Any?) -> String? {
-        guard let value else { return nil }
-        if let string = value as? String { return string.isEmpty ? nil : string }
+        guard let value, !(value is NSNull) else { return nil }
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+            return number.stringValue
+        }
+        if value is Bool || value is [String: Any] || value is [Any] { return nil }
         return String(describing: value)
     }
 }
+
+private actor CodexRemoteUsageCache {
+    private struct Entry {
+        let fetchedAt: Date
+        let summary: TokenUsageSummary
+    }
+
+    private let ttlSeconds: TimeInterval = 10 * 60
+    private var entries: [String: Entry] = [:]
+    private var backoffUntil: [String: Date] = [:]
+
+    func cachedSummary(for key: String, now: Date) -> TokenUsageSummary? {
+        guard let entry = entries[key],
+              now.timeIntervalSince(entry.fetchedAt) < ttlSeconds else {
+            return nil
+        }
+        return entry.summary
+    }
+
+    func isBackedOff(for key: String, now: Date) -> Bool {
+        guard let until = backoffUntil[key] else { return false }
+        if until <= now {
+            backoffUntil.removeValue(forKey: key)
+            return false
+        }
+        return true
+    }
+
+    func store(summary: TokenUsageSummary, for key: String, now: Date) {
+        entries[key] = Entry(fetchedAt: now, summary: summary)
+        backoffUntil.removeValue(forKey: key)
+    }
+
+    func recordBackoff(for key: String, seconds: TimeInterval, now: Date) {
+        let clamped = min(max(seconds, 60), 3600)
+        backoffUntil[key] = now.addingTimeInterval(clamped)
+    }
+}
+

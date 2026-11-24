@@ -610,9 +610,12 @@ final class QuotaProvider: QuotaProviding {
             case other
         }
         let identity: String
+        let bucketId: String
         let groupLabel: String
         let groupRank: Int
         let bucketTitle: String
+        let openUsageTitle: String
+        let displayOrder: Int
         let cadence: Cadence
         let remainingFraction: Double
         let resetAt: Date?
@@ -653,11 +656,21 @@ final class QuotaProvider: QuotaProviding {
                 case .other:   shortCadenceTitle = bucketName
                 }
 
+                let (openUsageTitle, displayOrder) = formatAntigravityDisplaySlot(
+                    bucketId: bucketId,
+                    groupLabel: groupLabel,
+                    cadence: cadence,
+                    fallbackTitle: "\(groupLabel) \(shortCadenceTitle)"
+                )
+
                 parsed.append(AntigravityParsedBucket(
                     identity: "\(groupIndex):\(bucketId)",
+                    bucketId: bucketId,
                     groupLabel: groupLabel,
                     groupRank: groupRank,
                     bucketTitle: "\(groupLabel) \(shortCadenceTitle)",
+                    openUsageTitle: openUsageTitle,
+                    displayOrder: displayOrder,
                     cadence: cadence,
                     remainingFraction: remaining,
                     resetAt: resetAt
@@ -677,8 +690,10 @@ final class QuotaProvider: QuotaProviding {
         )
 
         let windowDuration = ToolID.antigravity.windowDuration
+        let weeklyDuration = ToolID.antigravity.weeklyWindowDuration
         let fiveHour: QuotaMetric? = selectedSession.map { bucket in
             buildAntigravitySessionMetric(
+                name: "5h",
                 remainingFraction: bucket.remainingFraction,
                 resetAt: bucket.resetAt,
                 detail: bucket.groupLabel,
@@ -695,7 +710,8 @@ final class QuotaProvider: QuotaProviding {
                 resetAt: bucket.resetAt,
                 detail: bucket.groupLabel,
                 context: "\(bucket.groupLabel.lowercased()) weekly",
-                isIdle: false
+                isIdle: false,
+                windowDurationSeconds: weeklyDuration
             )
         }
 
@@ -709,9 +725,42 @@ final class QuotaProvider: QuotaProviding {
                     resetAt: bucket.resetAt,
                     detail: bucket.groupLabel,
                     context: bucket.bucketTitle.lowercased(),
-                    isIdle: false
+                    isIdle: false,
+                    windowDurationSeconds: bucket.cadence == .weekly ? weeklyDuration : windowDuration
                 )
             }
+
+        let sortedDisplayBuckets = parsed.sorted { lhs, rhs in
+            if lhs.displayOrder != rhs.displayOrder { return lhs.displayOrder < rhs.displayOrder }
+            if lhs.groupRank != rhs.groupRank { return lhs.groupRank < rhs.groupRank }
+            return lhs.identity < rhs.identity
+        }
+        var seenDisplayTitles = Set<String>()
+        let displayMetrics: [QuotaMetric] = sortedDisplayBuckets.compactMap { bucket in
+            guard seenDisplayTitles.insert(bucket.openUsageTitle).inserted else { return nil }
+            switch bucket.cadence {
+            case .session:
+                return buildAntigravitySessionMetric(
+                    name: bucket.openUsageTitle,
+                    remainingFraction: bucket.remainingFraction,
+                    resetAt: bucket.resetAt,
+                    detail: bucket.groupLabel,
+                    windowDuration: windowDuration,
+                    now: now
+                )
+            case .weekly, .other:
+                return QuotaMetric(
+                    name: bucket.openUsageTitle,
+                    usedPercent: 1 - bucket.remainingFraction,
+                    remainingPercent: bucket.remainingFraction,
+                    resetAt: bucket.resetAt,
+                    detail: bucket.groupLabel,
+                    context: "\(bucket.openUsageTitle.lowercased()) weekly",
+                    isIdle: false,
+                    windowDurationSeconds: bucket.cadence == .weekly ? weeklyDuration : windowDuration
+                )
+            }
+        }
 
         let fiveHourKey = (fiveHour?.isIdle == true)
             ? "idle"
@@ -726,11 +775,39 @@ final class QuotaProvider: QuotaProviding {
             weekly: weekly,
             extras: extras,
             rawWindowKey: [source, fiveHourKey].joined(separator: "|"),
-            message: message
+            message: message,
+            displayMetrics: displayMetrics
         )
     }
 
+    private func formatAntigravityDisplaySlot(
+        bucketId: String,
+        groupLabel: String,
+        cadence: AntigravityParsedBucket.Cadence,
+        fallbackTitle: String
+    ) -> (title: String, order: Int) {
+        let lowerId = bucketId.lowercased()
+        let lowerGroup = groupLabel.lowercased()
+        if lowerId == "gemini-5h" || (groupLabel == "Gemini" && cadence == .session) {
+            return ("Gemini 5h", 0)
+        }
+        if lowerId == "gemini-weekly" || (groupLabel == "Gemini" && cadence == .weekly) {
+            return ("Gemini", 1)
+        }
+        if lowerGroup.contains("argon") && cadence == .weekly {
+            return ("Argon", 2)
+        }
+        if lowerId == "3p-5h" || (groupLabel == "Claude/GPT" && cadence == .session) {
+            return ("Claude 5h", 3)
+        }
+        if lowerId == "3p-weekly" || (groupLabel == "Claude/GPT" && cadence == .weekly) {
+            return ("Claude", 4)
+        }
+        return (fallbackTitle, 5)
+    }
+
     private func buildAntigravitySessionMetric(
+        name: String = "5h",
         remainingFraction: Double,
         resetAt: Date?,
         detail: String?,
@@ -744,13 +821,14 @@ final class QuotaProvider: QuotaProviding {
         let effectiveReset = resetAt ?? (isIdle ? now.addingTimeInterval(windowDuration) : nil)
 
         return QuotaMetric(
-            name: "5h",
+            name: name,
             usedPercent: 1 - remainingFraction,
             remainingPercent: remainingFraction,
             resetAt: effectiveReset,
             detail: detail,
             context: isIdle ? "5h idle window" : "\((detail ?? "antigravity").lowercased()) 5h",
-            isIdle: isIdle
+            isIdle: isIdle,
+            windowDurationSeconds: windowDuration
         )
     }
 
@@ -919,11 +997,13 @@ final class QuotaProvider: QuotaProviding {
         }
 
         let windowDuration = ToolID.antigravity.windowDuration
+        let weeklyDuration = ToolID.antigravity.weeklyWindowDuration
         let chosenSession = pickBest(sessionCandidates)
         let chosenWeekly = pickBest(weeklyCandidates)
 
         let fiveHour = chosenSession.map { c in
             buildAntigravitySessionMetric(
+                name: "5h",
                 remainingFraction: c.remainingFraction,
                 resetAt: c.resetAt,
                 detail: c.label,
@@ -939,8 +1019,55 @@ final class QuotaProvider: QuotaProviding {
                 resetAt: c.resetAt,
                 detail: c.label,
                 context: "\(c.label.lowercased()) weekly",
-                isIdle: false
+                isIdle: false,
+                windowDurationSeconds: weeklyDuration
             )
+        }
+
+        var displayMetrics: [QuotaMetric] = []
+        if let g5 = pickBest(sessionCandidates.filter(\.isGemini)) {
+            displayMetrics.append(buildAntigravitySessionMetric(
+                name: "Gemini 5h",
+                remainingFraction: g5.remainingFraction,
+                resetAt: g5.resetAt,
+                detail: g5.label,
+                windowDuration: windowDuration,
+                now: now
+            ))
+        }
+        if let gw = pickBest(weeklyCandidates.filter(\.isGemini)) {
+            displayMetrics.append(QuotaMetric(
+                name: "Gemini",
+                usedPercent: 1 - gw.remainingFraction,
+                remainingPercent: gw.remainingFraction,
+                resetAt: gw.resetAt,
+                detail: gw.label,
+                context: "gemini weekly",
+                isIdle: false,
+                windowDurationSeconds: weeklyDuration
+            ))
+        }
+        if let c5 = pickBest(sessionCandidates.filter { !$0.isGemini }) {
+            displayMetrics.append(buildAntigravitySessionMetric(
+                name: "Claude 5h",
+                remainingFraction: c5.remainingFraction,
+                resetAt: c5.resetAt,
+                detail: c5.label,
+                windowDuration: windowDuration,
+                now: now
+            ))
+        }
+        if let cw = pickBest(weeklyCandidates.filter { !$0.isGemini }) {
+            displayMetrics.append(QuotaMetric(
+                name: "Claude",
+                usedPercent: 1 - cw.remainingFraction,
+                remainingPercent: cw.remainingFraction,
+                resetAt: cw.resetAt,
+                detail: cw.label,
+                context: "claude weekly",
+                isIdle: false,
+                windowDurationSeconds: weeklyDuration
+            ))
         }
 
         let fiveHourKey = (fiveHour?.isIdle == true)
@@ -956,7 +1083,8 @@ final class QuotaProvider: QuotaProviding {
             weekly: weekly,
             extras: [],
             rawWindowKey: [source, fiveHourKey].joined(separator: "|"),
-            message: message
+            message: message,
+            displayMetrics: displayMetrics
         )
     }
 
