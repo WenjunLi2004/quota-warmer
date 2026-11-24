@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="${QW_GITHUB_REPO:-WenjunLi2004/quota-warmer}"
-TAG="${1:-v1.10.0-rc.2}"
+TAG="${1:-v1.10.0-rc.3}"
 VERSION="${TAG#v}"
 DMG_NAME="QuotaWarmer-${VERSION}-universal.dmg"
 BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"

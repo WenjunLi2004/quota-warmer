@@ -113,8 +113,31 @@ enum ToolID: String, CaseIterable, Identifiable, Codable {
     var activityDirectoryURLs: [URL] {
         let home = FileManager.default.homeDirectoryForCurrentUser
         switch self {
-        case .claude, .codex:
+        case .claude:
             return [logDirectoryURL].compactMap { $0 }
+        case .codex:
+            var codexHomes: [URL] = []
+            if let envHome = ProcessInfo.processInfo.environment["CODEX_HOME"] {
+                for raw in envHome.split(separator: ",") {
+                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        codexHomes.append(URL(fileURLWithPath: trimmed, isDirectory: true))
+                    }
+                }
+            }
+            codexHomes.append(home.appendingPathComponent(".config/codex", isDirectory: true))
+            codexHomes.append(home.appendingPathComponent(".codex", isDirectory: true))
+
+            var seen = Set<String>()
+            var activeDirs: [URL] = []
+            var archivedDirs: [URL] = []
+            for base in codexHomes {
+                let canonicalHome = base.standardizedFileURL.path
+                guard seen.insert(canonicalHome).inserted else { continue }
+                activeDirs.append(base.appendingPathComponent("sessions", isDirectory: true))
+                archivedDirs.append(base.appendingPathComponent("archived_sessions", isDirectory: true))
+            }
+            return activeDirs + archivedDirs
         case .antigravity:
             let geminiHome = ProcessInfo.processInfo.environment["GEMINI_CLI_HOME"]?
                 .trimmingCharacters(in: .whitespacesAndNewlines)

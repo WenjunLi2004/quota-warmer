@@ -807,6 +807,7 @@ struct QuotaExtractorRegression {
         testAntigravityQuotaAndParser()
         testAntigravityLocalUsageAndActivity()
         testSmartSchedulingAndAlertPolicies()
+        testCodexTokenCountingAccuracyFixes()
 
         let asyncDone = DispatchSemaphore(value: 0)
         Task.detached {
@@ -1630,5 +1631,62 @@ struct QuotaExtractorRegression {
         require(MenuBarDisplayStyle.resolve(rawValue: nil) == .both, "Default menu bar style should be .both")
         require(MenuBarDisplayStyle.resolve(rawValue: "percent") == .percentOnly, "Percent menu bar style should resolve")
         require(MenuBarDisplayStyle.resolve(rawValue: "countdown") == .countdownOnly, "Countdown menu bar style should resolve")
+    }
+
+    private static func testCodexTokenCountingAccuracyFixes() {
+        let provider = LocalUsageProvider(calendar: utcCalendar)
+        let now = isoDate("2026-06-15T18:00:00Z")
+        let codexHome = temporaryDirectory("codex-accuracy")
+        defer { try? FileManager.default.removeItem(at: codexHome) }
+
+        let sessionsDir = codexHome.appendingPathComponent("sessions", isDirectory: true)
+        let archivedDir = codexHome.appendingPathComponent("archived_sessions", isDirectory: true)
+        createDirectory(sessionsDir)
+        createDirectory(archivedDir)
+
+        // 1. Root session with duplicate `token_count` snapshots (unchanged total_token_usage)
+        //    and yesterday's history that will be replayed by a subagent today.
+        let rootRollout = sessionsDir.appendingPathComponent("rollout-2026-06-14-root.jsonl")
+        writeJSONL([
+            #"{"timestamp":"2026-06-14T10:00:00Z","type":"session_meta","payload":{"id":"sess_root","model":"gpt-5.4"}}"#,
+            #"{"timestamp":"2026-06-14T10:01:00Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+            #"{"timestamp":"2026-06-14T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            // Duplicate UI / rate_limits refresh re-emits with identical total_token_usage: MUST NOT overcount!
+            #"{"timestamp":"2026-06-14T10:02:05Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            #"{"timestamp":"2026-06-14T10:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            // Second real turn yesterday:
+            #"{"timestamp":"2026-06-14T10:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":28000,"cached_input_tokens":25000,"output_tokens":1000,"total_tokens":29000},"total_token_usage":{"input_tokens":48000,"cached_input_tokens":40000,"output_tokens":2000,"total_tokens":50000}}}}"#
+        ], to: rootRollout)
+
+        // Duplicate copy of the active rollout inside archived_sessions: active copy must win (no double count).
+        try! FileManager.default.copyItem(at: rootRollout, to: archivedDir.appendingPathComponent("rollout-2026-06-14-root.jsonl"))
+
+        // 2. Subagent (`thread_spawn` / `forked_from_id`) spawned TODAY replaying yesterday's parent history
+        //    with TODAY's timestamps, followed by its own real turn using dated `gpt-5.6-2026-06-01` via `model_name`.
+        let subagentRollout = sessionsDir.appendingPathComponent("rollout-2026-06-15-subagent.jsonl")
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T09:00:00Z","type":"session_meta","payload":{"id":"sess_child","forked_from_id":"sess_root","source":{"subagent":{"thread_spawn":true}}}}"#,
+            #"{"timestamp":"2026-06-15T09:00:00.100Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            #"{"timestamp":"2026-06-15T09:00:00.200Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000},"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"output_tokens":1000,"total_tokens":21000}}}}"#,
+            #"{"timestamp":"2026-06-15T09:00:00.300Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":28000,"cached_input_tokens":25000,"output_tokens":1000,"total_tokens":29000},"total_token_usage":{"input_tokens":48000,"cached_input_tokens":40000,"output_tokens":2000,"total_tokens":50000}}}}"#,
+            #"{"timestamp":"2026-06-15T09:01:00Z","type":"turn_context","payload":{"model_name":"openai/gpt-5.6-2026-06-01"}}"#,
+            #"{"timestamp":"2026-06-15T09:01:10Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7000,"cached_input_tokens":5000,"output_tokens":1000,"total_tokens":8000},"total_token_usage":{"input_tokens":7000,"cached_input_tokens":5000,"output_tokens":1000,"total_tokens":8000}}}}"#
+        ], to: subagentRollout)
+
+        // 3. Archived-only session from today using `token_usage_record` + mirrored `token_count` + long-context `gpt-5.4`.
+        let archivedOnly = archivedDir.appendingPathComponent("rollout-2026-06-15-archived.jsonl")
+        writeJSONL([
+            #"{"timestamp":"2026-06-15T11:00:00Z","type":"session_meta","payload":{"id":"sess_archived","model":"gpt-5.4"}}"#,
+            #"{"timestamp":"2026-06-15T11:05:00Z","type":"token_usage_record","payload":{"thread_id":"sess_archived","response_id":"resp_lc_1","model":"gpt-5.4","usage":{"input_tokens":300000,"cached_input_tokens":250000,"output_tokens":1000,"total_tokens":301000},"thread_token_usage":{"input_tokens":300000,"cached_input_tokens":250000,"output_tokens":1000,"total_tokens":301000}}}"#,
+            #"{"timestamp":"2026-06-15T11:05:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300000,"cached_input_tokens":250000,"output_tokens":1000,"total_tokens":301000},"total_token_usage":{"input_tokens":300000,"cached_input_tokens":250000,"output_tokens":1000,"total_tokens":301000}}}}"#
+        ], to: archivedOnly)
+
+        let summary = provider.usage(for: .codex, baseURL: sessionsDir, now: now)
+        require(summary.yesterday.totalTokens == 50_000, "Yesterday should equal 50,000 tokens without duplicate snapshots, got \(summary.yesterday.totalTokens)")
+        require(summary.today.totalTokens == 309_000, "Today should equal 309,000 tokens (excluding parent replay & ledger mirror), got \(summary.today.totalTokens)")
+        require(summary.today.uncachedInputTokens == 52_000, "Today uncached input should equal 52,000, got \(summary.today.uncachedInputTokens)")
+        require(summary.today.cachedInputTokens == 255_000, "Today cached input should equal 255,000, got \(summary.today.cachedInputTokens)")
+        require(summary.today.outputTokens == 2_000, "Today output should equal 2,000, got \(summary.today.outputTokens)")
+        requireClose(summary.today.costUSD, 0.4275, "Today Codex cost should normalize gpt-5.6 dated slug and apply >272K long-context pricing")
     }
 }

@@ -136,26 +136,45 @@ struct ToolTabView: View {
                 }
             }
             VStack(alignment: .leading, spacing: 6) {
-                tokenUsageRow("Today", usage: toolState.tokenUsageSummary?.today)
+                tokenUsageRow("Today", usage: toolState.tokenUsageSummary?.today, showBreakdownInline: true)
                 tokenUsageRow("Yesterday", usage: toolState.tokenUsageSummary?.yesterday)
                 tokenUsageRow("Last 30 Days", usage: toolState.tokenUsageSummary?.last30Days)
             }
         }
     }
 
-    private func tokenUsageRow(_ title: String, usage: TokenUsageDay?) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(title)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(DS.C.textSub)
-                .lineLimit(1)
-            Spacer(minLength: 8)
-            Text(tokenUsageValue(usage))
-                .font(DS.mono(11, weight: .semibold))
-                .foregroundStyle(usage == nil ? DS.C.textMuted : DS.C.text)
-                .lineLimit(1)
-                .minimumScaleFactor(0.74)
+    private func tokenUsageRow(_ title: String, usage: TokenUsageDay?, showBreakdownInline: Bool = false) -> some View {
+        let breakdown = tokenBreakdownText(usage)
+        return VStack(alignment: .trailing, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(title)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(DS.C.textSub)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text(tokenUsageValue(usage))
+                    .font(DS.mono(11, weight: .semibold))
+                    .foregroundStyle(usage == nil ? DS.C.textMuted : DS.C.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.74)
+            }
+            if showBreakdownInline, let breakdown {
+                Text(breakdown)
+                    .font(DS.mono(9.5, weight: .regular))
+                    .foregroundStyle(DS.C.textMuted)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
         }
+        .help(breakdown ?? "")
+    }
+
+    private func tokenBreakdownText(_ usage: TokenUsageDay?) -> String? {
+        guard let usage, usage.totalTokens > 0 else { return nil }
+        guard usage.uncachedInputTokens > 0 || usage.cachedInputTokens > 0 || usage.outputTokens > 0 else {
+            return nil
+        }
+        return "New in \(shortTokenNumber(usage.uncachedInputTokens)) · Cached \(shortTokenNumber(usage.cachedInputTokens)) · Out \(shortTokenNumber(usage.outputTokens))"
     }
 
     private func tokenUsageValue(_ usage: TokenUsageDay?) -> String {
@@ -168,17 +187,21 @@ struct ToolTabView: View {
         return String(format: "$%.2f", value)
     }
 
-    private func formatTokenCount(_ count: Int) -> String {
+    private func shortTokenNumber(_ count: Int) -> String {
         if count >= 1_000_000_000 {
-            return "\(compactCount(count, divisor: 1_000_000_000))B tokens"
+            return "\(compactCount(count, divisor: 1_000_000_000))B"
         }
         if count >= 1_000_000 {
-            return "\(compactCount(count, divisor: 1_000_000))M tokens"
+            return "\(compactCount(count, divisor: 1_000_000))M"
         }
         if count >= 1_000 {
-            return "\(compactCount(count, divisor: 1_000))K tokens"
+            return "\(compactCount(count, divisor: 1_000))K"
         }
-        return "\(Self.integerFormatter.string(from: NSNumber(value: count)) ?? "\(count)") tokens"
+        return Self.integerFormatter.string(from: NSNumber(value: count)) ?? "\(count)"
+    }
+
+    private func formatTokenCount(_ count: Int) -> String {
+        "\(shortTokenNumber(count)) tokens"
     }
 
     private func compactCount(_ count: Int, divisor: Double) -> String {

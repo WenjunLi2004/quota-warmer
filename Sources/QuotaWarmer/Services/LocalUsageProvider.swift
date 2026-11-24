@@ -5,6 +5,8 @@ final class LocalUsageProvider {
         let date: Date
         let model: String?
         let inputTokens: Int
+        let uncachedInput: Int
+        let cachedInput: Int
         let cacheCreationFiveMinuteTokens: Int
         let cacheCreationOneHourTokens: Int
         let cacheReadTokens: Int
@@ -16,10 +18,22 @@ final class LocalUsageProvider {
 
     private struct UsageBucket {
         var tokens = 0
+        var uncachedInput = 0
+        var cachedInput = 0
+        var output = 0
         var costUSD: Double?
 
-        mutating func add(tokens: Int, cost: Double?) {
+        mutating func add(
+            tokens: Int,
+            uncachedInput: Int = 0,
+            cachedInput: Int = 0,
+            output: Int = 0,
+            cost: Double?
+        ) {
             self.tokens += tokens
+            self.uncachedInput += uncachedInput
+            self.cachedInput += cachedInput
+            self.output += output
             guard let cost else { return }
             self.costUSD = (self.costUSD ?? 0) + cost
         }
@@ -31,6 +45,66 @@ final class LocalUsageProvider {
         let cacheRead: Double
         let output: Double
         let cacheReadExplicit: Bool
+    }
+
+    private struct CodexPricingTier {
+        let input: Double
+        let cacheRead: Double
+        let output: Double
+        let longContextThreshold: Int?
+        let inputAboveThreshold: Double?
+        let cacheReadAboveThreshold: Double?
+        let outputAboveThreshold: Double?
+
+        init(
+            input: Double,
+            cacheRead: Double,
+            output: Double,
+            longContextOutput: Double? = nil
+        ) {
+            self.input = input
+            self.cacheRead = cacheRead
+            self.output = output
+            if let longContextOutput {
+                self.longContextThreshold = 272_000
+                self.inputAboveThreshold = input * 2.0
+                self.cacheReadAboveThreshold = cacheRead * 2.0
+                self.outputAboveThreshold = longContextOutput
+            } else {
+                self.longContextThreshold = nil
+                self.inputAboveThreshold = nil
+                self.cacheReadAboveThreshold = nil
+                self.outputAboveThreshold = nil
+            }
+        }
+    }
+
+    private struct CodexTotals: Hashable {
+        let input: Int
+        let cached: Int
+        let output: Int
+        let total: Int
+    }
+
+    private struct CodexSnapshotKey: Hashable {
+        let total: CodexTotals
+        let lastInput: Int
+        let lastCached: Int
+        let lastOutput: Int
+    }
+
+    private struct CodexCandidateEvent {
+        let record: UsageRecord
+        let responseID: String?
+        let snapshotKey: CodexSnapshotKey?
+        let beforeFirstTurnContext: Bool
+        let totalExceedsLast: Bool
+    }
+
+    private struct ParsedCodexFile {
+        let sessionId: String?
+        let isForkOrSubagent: Bool
+        let events: [CodexCandidateEvent]
     }
 
     private let fileManager: FileManager
@@ -67,11 +141,8 @@ final class LocalUsageProvider {
                 buckets = [:]
             }
         case .codex:
-            if let root = baseURL ?? tool.logDirectoryURL, fileManager.fileExists(atPath: root.path) {
-                buckets = codexBuckets(in: root, since: since)
-            } else {
-                buckets = [:]
-            }
+            let roots = codexRoots(baseURL: baseURL)
+            buckets = roots.isEmpty ? [:] : codexBuckets(in: roots, since: since)
         case .antigravity:
             let roots = (baseURL.map { [$0] } ?? tool.activityDirectoryURLs)
                 .filter { fileManager.fileExists(atPath: $0.path) }
@@ -83,7 +154,13 @@ final class LocalUsageProvider {
         let last30Bucket = buckets
             .filter { $0.key >= since && $0.key <= today }
             .reduce(into: UsageBucket()) { aggregate, entry in
-                aggregate.add(tokens: entry.value.tokens, cost: entry.value.costUSD)
+                aggregate.add(
+                    tokens: entry.value.tokens,
+                    uncachedInput: entry.value.uncachedInput,
+                    cachedInput: entry.value.cachedInput,
+                    output: entry.value.output,
+                    cost: entry.value.costUSD
+                )
             }
 
         let sourceLabel: String
@@ -96,10 +173,36 @@ final class LocalUsageProvider {
         return TokenUsageSummary(
             fetchedAt: now,
             source: sourceLabel,
-            today: TokenUsageDay(date: today, totalTokens: todayBucket.tokens, costUSD: todayBucket.costUSD ?? 0),
-            yesterday: TokenUsageDay(date: yesterday, totalTokens: yesterdayBucket.tokens, costUSD: yesterdayBucket.costUSD ?? 0),
-            last30Days: TokenUsageDay(date: since, totalTokens: last30Bucket.tokens, costUSD: last30Bucket.costUSD ?? 0)
+            today: makeDay(date: today, bucket: todayBucket),
+            yesterday: makeDay(date: yesterday, bucket: yesterdayBucket),
+            last30Days: makeDay(date: since, bucket: last30Bucket)
         )
+    }
+
+    private func makeDay(date: Date, bucket: UsageBucket) -> TokenUsageDay {
+        let resolvedCost: Double? = bucket.costUSD ?? (bucket.tokens == 0 ? 0 : nil)
+        return TokenUsageDay(
+            date: date,
+            totalTokens: bucket.tokens,
+            costUSD: resolvedCost,
+            uncachedInputTokens: bucket.uncachedInput,
+            cachedInputTokens: bucket.cachedInput,
+            outputTokens: bucket.output
+        )
+    }
+
+    private func codexRoots(baseURL: URL?) -> [URL] {
+        if let baseURL {
+            var list = [baseURL]
+            if baseURL.lastPathComponent == "sessions" {
+                let archived = baseURL
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("archived_sessions", isDirectory: true)
+                list.append(archived)
+            }
+            return list.filter { fileManager.fileExists(atPath: $0.path) }
+        }
+        return ToolID.codex.activityDirectoryURLs.filter { fileManager.fileExists(atPath: $0.path) }
     }
 
     private func claudeBuckets(in root: URL, since: Date) -> [Date: UsageBucket] {
@@ -120,22 +223,300 @@ final class LocalUsageProvider {
         return buckets(from: Array(recordsByID.values), pricing: claudeCost)
     }
 
-    private func codexBuckets(in root: URL, since: Date) -> [Date: UsageBucket] {
-        var records: [UsageRecord] = []
-        enumerateJSONL(in: root, since: since) { url in
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-            var currentModel: String?
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-            for line in lines {
-                guard let object = jsonObject(String(line)) else { continue }
-                currentModel = model(from: object) ?? currentModel
-                guard let date = date(from: object),
-                      date >= since,
-                      let record = codexRecord(from: object, date: date, model: currentModel) else { continue }
-                records.append(record)
+    private func codexBuckets(in roots: [URL], since: Date) -> [Date: UsageBucket] {
+        var parsedFiles: [ParsedCodexFile] = []
+        var seenCanonicalPaths = Set<String>()
+        var seenRolloutNames = Set<String>()
+
+        for root in roots {
+            enumerateJSONL(in: root, since: since) { url in
+                let canonical = url.resolvingSymlinksInPath().path
+                guard seenCanonicalPaths.insert(canonical).inserted else { return }
+                let filename = url.lastPathComponent
+                if filename.hasPrefix("rollout-") {
+                    // Active `sessions/` roots are scanned before `archived_sessions/`,
+                    // so an active copy wins over an archived copy of the same rollout.
+                    guard seenRolloutNames.insert(filename).inserted else { return }
+                }
+                if let parsed = parseCodexFile(url, since: since), !parsed.events.isEmpty {
+                    parsedFiles.append(parsed)
+                }
             }
         }
-        return buckets(from: records, pricing: codexCost)
+
+        // Two-pass deduplication:
+        // Pass 1 processes root sessions and records their (total_token_usage, last_token_usage)
+        // snapshots. Pass 2 processes forked / subagent rollouts, skipping replayed parent
+        // history snapshots so spawned subagents or resumed forks never inflate token counts.
+        var acceptedRecords: [UsageRecord] = []
+        var seenResponseIDs = Set<String>()
+        var seenSnapshots = Set<CodexSnapshotKey>()
+
+        for file in parsedFiles where !file.isForkOrSubagent {
+            for event in file.events {
+                if let rid = event.responseID, !seenResponseIDs.insert(rid).inserted {
+                    continue
+                }
+                if let snap = event.snapshotKey {
+                    seenSnapshots.insert(snap)
+                }
+                acceptedRecords.append(event.record)
+            }
+        }
+
+        for file in parsedFiles where file.isForkOrSubagent {
+            for event in file.events {
+                if let rid = event.responseID, !seenResponseIDs.insert(rid).inserted {
+                    continue
+                }
+                if let snap = event.snapshotKey {
+                    if seenSnapshots.contains(snap) {
+                        continue
+                    }
+                    // When the parent file is older than the 30-day lookback window,
+                    // a forked/subagent rollout still replays parent history at spawn
+                    // before the child's first turn_context, with cumulative totals > last.
+                    if event.beforeFirstTurnContext && event.totalExceedsLast {
+                        continue
+                    }
+                    seenSnapshots.insert(snap)
+                }
+                acceptedRecords.append(event.record)
+            }
+        }
+
+        return buckets(from: acceptedRecords, pricing: codexCost)
+    }
+
+    private func parseCodexFile(_ url: URL, since: Date) -> ParsedCodexFile? {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        var currentModel: String?
+        var sessionId: String?
+        var isForkOrSubagent = false
+        var sawTurnContext = false
+        var prevTotal: CodexTotals?
+        var ledgerThreadTotals = Set<CodexTotals>()
+        var events: [CodexCandidateEvent] = []
+
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        for line in lines {
+            guard let object = jsonObject(String(line)) else { continue }
+            currentModel = model(from: object) ?? currentModel
+
+            let topType = object["type"] as? String
+            let payload = object["payload"] as? [String: Any]
+            let payloadType = payload?["type"] as? String
+
+            if topType == "session_meta" || payloadType == "session_meta" {
+                let meta = payload ?? object
+                if sessionId == nil {
+                    sessionId = stringValue(meta["id"] ?? meta["session_id"] ?? meta["thread_id"])
+                }
+                if meta["forked_from_id"] != nil
+                    || meta["parent_thread_id"] != nil
+                    || isSubagentSource(meta["source"]) {
+                    isForkOrSubagent = true
+                }
+                continue
+            }
+
+            if topType == "turn_context" || payloadType == "turn_context" {
+                sawTurnContext = true
+                continue
+            }
+
+            if payloadType == "user_message" || payloadType == "task_started" {
+                sawTurnContext = true
+                continue
+            }
+
+            // 1. Modern Codex per-request ledger record (`type == "token_usage_record"`).
+            if topType == "token_usage_record",
+               let payload,
+               let usageDict = payload["usage"] as? [String: Any] {
+                let threadTotal = (payload["thread_token_usage"] as? [String: Any]).flatMap(parseCodexTotals)
+                if let threadTotal {
+                    ledgerThreadTotals.insert(threadTotal)
+                    prevTotal = threadTotal
+                }
+                guard let recordDate = date(from: object), recordDate >= since else { continue }
+                let rowModel = stringValue(payload["model"]) ?? currentModel
+                let input = intValue(usageDict["input_tokens"])
+                let cached = min(
+                    max(intValue(usageDict["cached_input_tokens"]), intValue(usageDict["cache_read_input_tokens"])),
+                    input
+                )
+                let output = intValue(usageDict["output_tokens"])
+                let explicitTotal = intValue(usageDict["total_tokens"])
+                let resolvedTotal = explicitTotal > 0 ? explicitTotal : (input + output)
+                guard resolvedTotal > 0 else { continue }
+
+                let record = UsageRecord(
+                    date: recordDate,
+                    model: rowModel,
+                    inputTokens: input,
+                    uncachedInput: max(0, input - cached),
+                    cachedInput: cached,
+                    cacheCreationFiveMinuteTokens: 0,
+                    cacheCreationOneHourTokens: 0,
+                    cacheReadTokens: 0,
+                    cachedInputTokens: cached,
+                    outputTokens: output,
+                    totalTokens: resolvedTotal,
+                    explicitCostUSD: explicitCost(from: object)
+                )
+                let snap = threadTotal.map {
+                    CodexSnapshotKey(total: $0, lastInput: input, lastCached: cached, lastOutput: output)
+                }
+                events.append(CodexCandidateEvent(
+                    record: record,
+                    responseID: stringValue(payload["response_id"]),
+                    snapshotKey: snap,
+                    beforeFirstTurnContext: !sawTurnContext,
+                    totalExceedsLast: (threadTotal?.total ?? 0) > resolvedTotal
+                ))
+                continue
+            }
+
+            // 2. Standard Codex `token_count` event (`payload.type == "token_count"`).
+            if payloadType == "token_count",
+               let info = payload?["info"] as? [String: Any] {
+                let total = (info["total_token_usage"] as? [String: Any]).flatMap(parseCodexTotals)
+
+                // Skip duplicate `token_count` snapshots where `total_token_usage` has not
+                // changed (emitted on rate-limit / UI refreshes, 40%+ of real Codex rows),
+                // and skip rows already accounted for by a `token_usage_record` mirror.
+                if let total {
+                    if total == prevTotal || ledgerThreadTotals.contains(total) {
+                        prevTotal = total
+                        continue
+                    }
+                }
+
+                let priorTotal = prevTotal
+                if let total { prevTotal = total }
+
+                let input: Int
+                let cached: Int
+                let output: Int
+                let resolvedTotal: Int
+
+                if let lastDict = info["last_token_usage"] as? [String: Any] {
+                    input = intValue(lastDict["input_tokens"])
+                    cached = min(
+                        max(intValue(lastDict["cached_input_tokens"]), intValue(lastDict["cache_read_input_tokens"])),
+                        input
+                    )
+                    output = intValue(lastDict["output_tokens"])
+                    let explicitTotal = intValue(lastDict["total_tokens"])
+                    resolvedTotal = explicitTotal > 0 ? explicitTotal : (input + output)
+                } else if let total, let priorTotal, total.total > priorTotal.total {
+                    input = max(0, total.input - priorTotal.input)
+                    cached = min(max(0, total.cached - priorTotal.cached), input)
+                    output = max(0, total.output - priorTotal.output)
+                    resolvedTotal = max(0, total.total - priorTotal.total)
+                } else {
+                    continue
+                }
+
+                // Zero-usage checkpoint markers carry inherited context, not billed usage.
+                guard resolvedTotal > 0, let recordDate = date(from: object), recordDate >= since else {
+                    continue
+                }
+
+                let record = UsageRecord(
+                    date: recordDate,
+                    model: currentModel,
+                    inputTokens: input,
+                    uncachedInput: max(0, input - cached),
+                    cachedInput: cached,
+                    cacheCreationFiveMinuteTokens: 0,
+                    cacheCreationOneHourTokens: 0,
+                    cacheReadTokens: 0,
+                    cachedInputTokens: cached,
+                    outputTokens: output,
+                    totalTokens: resolvedTotal,
+                    explicitCostUSD: explicitCost(from: object)
+                )
+                let snap = total.map {
+                    CodexSnapshotKey(total: $0, lastInput: input, lastCached: cached, lastOutput: output)
+                }
+                events.append(CodexCandidateEvent(
+                    record: record,
+                    responseID: nil,
+                    snapshotKey: snap,
+                    beforeFirstTurnContext: !sawTurnContext,
+                    totalExceedsLast: (total?.total ?? 0) > resolvedTotal
+                ))
+                continue
+            }
+
+            // 3. One-shot `codex exec --json` completion envelopes (`turn.completed` / `response.completed`).
+            if topType == "turn.completed" || topType == "response.completed",
+               let recordDate = date(from: object),
+               recordDate >= since,
+               let usageDict = (object["usage"] as? [String: Any])
+                   ?? ((object["response"] as? [String: Any])?["usage"] as? [String: Any]) {
+                let input = intValue(usageDict["input_tokens"] ?? usageDict["prompt_tokens"])
+                let cached = min(
+                    max(intValue(usageDict["cached_input_tokens"]), intValue(usageDict["cached_tokens"])),
+                    input
+                )
+                let output = intValue(usageDict["output_tokens"] ?? usageDict["completion_tokens"])
+                let explicitTotal = intValue(usageDict["total_tokens"])
+                let resolvedTotal = explicitTotal > 0 ? explicitTotal : (input + output)
+                guard resolvedTotal > 0 else { continue }
+                let record = UsageRecord(
+                    date: recordDate,
+                    model: currentModel,
+                    inputTokens: input,
+                    uncachedInput: max(0, input - cached),
+                    cachedInput: cached,
+                    cacheCreationFiveMinuteTokens: 0,
+                    cacheCreationOneHourTokens: 0,
+                    cacheReadTokens: 0,
+                    cachedInputTokens: cached,
+                    outputTokens: output,
+                    totalTokens: resolvedTotal,
+                    explicitCostUSD: explicitCost(from: object)
+                )
+                events.append(CodexCandidateEvent(
+                    record: record,
+                    responseID: stringValue((object["response"] as? [String: Any])?["id"] ?? object["response_id"]),
+                    snapshotKey: nil,
+                    beforeFirstTurnContext: false,
+                    totalExceedsLast: false
+                ))
+            }
+        }
+
+        return ParsedCodexFile(
+            sessionId: sessionId,
+            isForkOrSubagent: isForkOrSubagent,
+            events: events
+        )
+    }
+
+    private func parseCodexTotals(_ usage: [String: Any]) -> CodexTotals {
+        let input = intValue(usage["input_tokens"])
+        let cached = max(intValue(usage["cached_input_tokens"]), intValue(usage["cache_read_input_tokens"]))
+        let output = intValue(usage["output_tokens"])
+        let explicitTotal = intValue(usage["total_tokens"])
+        let total = explicitTotal > 0 ? explicitTotal : (input + output)
+        return CodexTotals(input: input, cached: cached, output: output, total: total)
+    }
+
+    private func isSubagentSource(_ source: Any?) -> Bool {
+        guard let source else { return false }
+        if let str = source as? String {
+            let lower = str.lowercased()
+            return lower.contains("subagent") || lower.contains("thread_spawn") || lower.contains("fork")
+        }
+        if let dict = source as? [String: Any] {
+            if dict["subagent"] != nil || dict["thread_spawn"] != nil { return true }
+            if let sub = dict["subagent"] as? [String: Any], sub["thread_spawn"] != nil { return true }
+        }
+        return false
     }
 
     private func antigravityBuckets(in roots: [URL], since: Date) -> [Date: UsageBucket] {
@@ -214,10 +595,15 @@ final class LocalUsageProvider {
         let resolvedTotal = explicitTotal > 0 ? explicitTotal : (input + cacheRead + combinedOutput)
         guard resolvedTotal > 0 else { return nil }
 
+        let inputIncludesCache = explicitTotal > 0 && input >= cacheRead
+        let uncachedIn = inputIncludesCache ? max(0, input - cacheRead) : input
+
         return UsageRecord(
             date: date,
             model: model,
             inputTokens: input,
+            uncachedInput: uncachedIn,
+            cachedInput: cacheRead,
             cacheCreationFiveMinuteTokens: 0,
             cacheCreationOneHourTokens: 0,
             cacheReadTokens: cacheRead,
@@ -262,7 +648,13 @@ final class LocalUsageProvider {
         records.reduce(into: [Date: UsageBucket]()) { buckets, record in
             let day = calendar.startOfDay(for: record.date)
             let cost = record.explicitCostUSD ?? pricing(record)
-            buckets[day, default: UsageBucket()].add(tokens: record.totalTokens, cost: cost)
+            buckets[day, default: UsageBucket()].add(
+                tokens: record.totalTokens,
+                uncachedInput: record.uncachedInput,
+                cachedInput: record.cachedInput,
+                output: record.outputTokens,
+                cost: cost
+            )
         }
     }
 
@@ -283,40 +675,14 @@ final class LocalUsageProvider {
             date: date,
             model: model(from: object),
             inputTokens: input,
+            uncachedInput: input + cacheCreation,
+            cachedInput: cacheRead,
             cacheCreationFiveMinuteTokens: cacheCreationFiveMinute,
             cacheCreationOneHourTokens: cacheCreationOneHour,
             cacheReadTokens: cacheRead,
             cachedInputTokens: 0,
             outputTokens: output,
             totalTokens: total,
-            explicitCostUSD: explicitCost(from: object)
-        )
-    }
-
-    private func codexRecord(from object: [String: Any], date: Date, model: String?) -> UsageRecord? {
-        guard let payload = object["payload"] as? [String: Any],
-              let type = payload["type"] as? String,
-              type == "token_count",
-              let info = payload["info"] as? [String: Any],
-              let usage = info["last_token_usage"] as? [String: Any] else { return nil }
-
-        let input = intValue(usage["input_tokens"])
-        let cached = intValue(usage["cached_input_tokens"])
-        let output = intValue(usage["output_tokens"])
-        let total = intValue(usage["total_tokens"])
-        let resolvedTotal = total > 0 ? total : input + output
-        guard resolvedTotal > 0 else { return nil }
-
-        return UsageRecord(
-            date: date,
-            model: model,
-            inputTokens: input,
-            cacheCreationFiveMinuteTokens: 0,
-            cacheCreationOneHourTokens: 0,
-            cacheReadTokens: 0,
-            cachedInputTokens: cached,
-            outputTokens: output,
-            totalTokens: resolvedTotal,
             explicitCostUSD: explicitCost(from: object)
         )
     }
@@ -334,13 +700,16 @@ final class LocalUsageProvider {
     }
 
     private func codexCost(_ record: UsageRecord) -> Double? {
-        guard let rates = codexRates(for: record.model) else { return nil }
+        guard let tier = codexPricingTier(for: record.model) else { return nil }
         let cached = min(record.cachedInputTokens, record.inputTokens)
         let uncached = max(0, record.inputTokens - cached)
-        let cachedRate = rates.cacheReadExplicit ? rates.cacheRead : rates.input
-        return ((Double(uncached) * rates.input)
-            + (Double(cached) * cachedRate)
-            + (Double(record.outputTokens) * rates.output)) / 1_000_000
+        let isLongContext = tier.longContextThreshold.map { record.inputTokens > $0 } ?? false
+        let inRate = isLongContext ? (tier.inputAboveThreshold ?? tier.input) : tier.input
+        let cacheRate = isLongContext ? (tier.cacheReadAboveThreshold ?? tier.cacheRead) : tier.cacheRead
+        let outRate = isLongContext ? (tier.outputAboveThreshold ?? tier.output) : tier.output
+        return ((Double(uncached) * inRate)
+            + (Double(cached) * cacheRate)
+            + (Double(record.outputTokens) * outRate)) / 1_000_000
     }
 
     private func cost(
@@ -381,26 +750,86 @@ final class LocalUsageProvider {
         return ModelRates(input: 3.0, cacheWrite: 3.75, cacheRead: 0.30, output: 15.0, cacheReadExplicit: true)
     }
 
-    private func codexRates(for model: String?) -> ModelRates? {
+    private func normalizeCodexModel(_ raw: String) -> String {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.hasPrefix("openai/") {
+            trimmed = String(trimmed.dropFirst("openai/".count))
+        }
+        if let datedRange = trimmed.range(of: #"-\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) {
+            trimmed = String(trimmed[..<datedRange.lowerBound])
+        }
+        if trimmed == "gpt-5.6" || trimmed == "gpt-5.6-codex" || trimmed == "gpt-daybreak-blue-latest" {
+            return "gpt-5.6-sol"
+        }
+        if trimmed == "gpt-reserve" {
+            return "gpt-5.6-luna"
+        }
+        if trimmed == "gpt-daybreak-red-latest" {
+            return "gpt-5.6-cyber"
+        }
+        return trimmed
+    }
+
+    private func codexPricingTier(for model: String?) -> CodexPricingTier? {
         guard let model, !model.isEmpty else { return nil }
-        let text = model.lowercased()
-        switch text {
+        let normalized = normalizeCodexModel(model)
+        switch normalized {
+        case "gpt-6-astra":
+            return CodexPricingTier(input: 10.0, cacheRead: 1.0, output: 50.0, longContextOutput: 75.0)
+        case "gpt-6.2-astra":
+            return CodexPricingTier(input: 8.0, cacheRead: 0.40, output: 40.0, longContextOutput: 60.0)
+        case "gpt-6-sol":
+            return CodexPricingTier(input: 2.0, cacheRead: 0.20, output: 10.0, longContextOutput: 15.0)
+        case "gpt-6.1-sol", "gpt-6.2-sol":
+            return CodexPricingTier(input: 2.0, cacheRead: 0.10, output: 10.0, longContextOutput: 15.0)
+        case "gpt-6.1-terra":
+            return CodexPricingTier(input: 1.0, cacheRead: 0.05, output: 5.0, longContextOutput: 7.50)
+        case "gpt-6-luna":
+            return CodexPricingTier(input: 0.10, cacheRead: 0.01, output: 0.50, longContextOutput: 0.75)
+        case "gpt-5.6-sol":
+            return CodexPricingTier(input: 4.0, cacheRead: 0.40, output: 20.0, longContextOutput: 30.0)
+        case "gpt-5.6-terra":
+            return CodexPricingTier(input: 2.0, cacheRead: 0.20, output: 12.0, longContextOutput: 18.0)
+        case "gpt-5.6-luna":
+            return CodexPricingTier(input: 0.20, cacheRead: 0.02, output: 1.20, longContextOutput: 1.80)
+        case "gpt-5.6-cyber", "gpt-5.5-cyber":
+            return CodexPricingTier(input: 12.5, cacheRead: 1.25, output: 75.0)
         case "gpt-5.5":
-            return ModelRates(input: 5.0, cacheWrite: 5.0, cacheRead: 0.50, output: 30.0, cacheReadExplicit: true)
+            return CodexPricingTier(input: 5.0, cacheRead: 0.50, output: 30.0, longContextOutput: 45.0)
+        case "gpt-5.5-pro", "gpt-5.4-pro":
+            return CodexPricingTier(input: 30.0, cacheRead: 30.0, output: 180.0, longContextOutput: 270.0)
         case "gpt-5.4":
-            return ModelRates(input: 2.5, cacheWrite: 2.5, cacheRead: 0.25, output: 15.0, cacheReadExplicit: true)
+            return CodexPricingTier(input: 2.5, cacheRead: 0.25, output: 15.0, longContextOutput: 22.5)
         case "gpt-5.4-mini":
-            return ModelRates(input: 0.75, cacheWrite: 0.75, cacheRead: 0.075, output: 4.5, cacheReadExplicit: true)
+            return CodexPricingTier(input: 0.75, cacheRead: 0.075, output: 4.5)
         case "gpt-5.4-nano":
-            return ModelRates(input: 0.20, cacheWrite: 0.20, cacheRead: 0.020, output: 1.25, cacheReadExplicit: true)
-        case "gpt-5.3-codex", "gpt-5.3-spark", "gpt-5.3-codex-spark", "gpt-5.2", "gpt-5.2-codex":
-            return ModelRates(input: 1.75, cacheWrite: 1.75, cacheRead: 0.175, output: 14.0, cacheReadExplicit: true)
-        case "gpt-5", "gpt-5.1", "gpt-5.1-codex":
-            return ModelRates(input: 1.25, cacheWrite: 1.25, cacheRead: 0.125, output: 10.0, cacheReadExplicit: true)
+            return CodexPricingTier(input: 0.20, cacheRead: 0.020, output: 1.25)
+        case "gpt-5.3-codex-spark":
+            return CodexPricingTier(input: 0.0, cacheRead: 0.0, output: 0.0)
+        case "gpt-5.3-codex", "gpt-5.3-spark", "gpt-5.2", "gpt-5.2-codex":
+            return CodexPricingTier(input: 1.75, cacheRead: 0.175, output: 14.0)
+        case "gpt-5.2-pro":
+            return CodexPricingTier(input: 21.0, cacheRead: 21.0, output: 168.0)
+        case "gpt-5", "gpt-5-codex", "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-max":
+            return CodexPricingTier(input: 1.25, cacheRead: 0.125, output: 10.0)
+        case "gpt-5-pro":
+            return CodexPricingTier(input: 15.0, cacheRead: 15.0, output: 120.0)
         case "gpt-5-mini", "gpt-5.1-codex-mini":
-            return ModelRates(input: 0.25, cacheWrite: 0.25, cacheRead: 0.025, output: 2.0, cacheReadExplicit: true)
+            return CodexPricingTier(input: 0.25, cacheRead: 0.025, output: 2.0)
         case "gpt-5-nano":
-            return ModelRates(input: 0.05, cacheWrite: 0.05, cacheRead: 0.005, output: 0.40, cacheReadExplicit: true)
+            return CodexPricingTier(input: 0.05, cacheRead: 0.005, output: 0.40)
+        case "o3", "gpt-4.1":
+            return CodexPricingTier(input: 2.0, cacheRead: 0.50, output: 8.0)
+        case "o3-mini", "o4-mini", "codex-mini-latest":
+            return CodexPricingTier(input: 1.10, cacheRead: 0.275, output: 4.40)
+        case "gpt-4.1-mini":
+            return CodexPricingTier(input: 0.40, cacheRead: 0.10, output: 1.60)
+        case "gpt-4.1-nano":
+            return CodexPricingTier(input: 0.10, cacheRead: 0.025, output: 0.40)
+        case "gpt-4o":
+            return CodexPricingTier(input: 2.50, cacheRead: 1.25, output: 10.0)
+        case "gpt-4o-mini":
+            return CodexPricingTier(input: 0.15, cacheRead: 0.075, output: 0.60)
         default:
             return nil
         }
@@ -452,6 +881,7 @@ final class LocalUsageProvider {
         }
         if let payload = object["payload"] as? [String: Any] {
             if let value = stringValue(payload["model"]) { return value }
+            if let value = stringValue(payload["model_name"]) { return value }
             if let info = payload["info"] as? [String: Any] {
                 if let value = stringValue(info["model"]) { return value }
                 if let value = stringValue(info["model_name"]) { return value }

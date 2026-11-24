@@ -243,6 +243,25 @@ struct TokenUsageDay: Identifiable, Equatable {
     let date: Date
     let totalTokens: Int
     let costUSD: Double?
+    let uncachedInputTokens: Int
+    let cachedInputTokens: Int
+    let outputTokens: Int
+
+    init(
+        date: Date,
+        totalTokens: Int,
+        costUSD: Double?,
+        uncachedInputTokens: Int = 0,
+        cachedInputTokens: Int = 0,
+        outputTokens: Int = 0
+    ) {
+        self.date = date
+        self.totalTokens = totalTokens
+        self.costUSD = costUSD
+        self.uncachedInputTokens = uncachedInputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.outputTokens = outputTokens
+    }
 
     var id: Date { date }
 }
