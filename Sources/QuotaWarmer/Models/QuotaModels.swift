@@ -295,6 +295,21 @@ struct TokenUsageSummary: Equatable {
     }
 }
 
+/// Independent 5-hour quota pools exposed by Antigravity (`Gemini Models` vs
+/// `Claude and GPT models`). Each pool has its own rolling 5h window and must
+/// be claimed and deduplicated independently.
+enum AntigravityQuotaPool: String, CaseIterable, Codable, Hashable {
+    case gemini = "gemini"
+    case thirdParty = "3p"
+
+    var displayName: String {
+        switch self {
+        case .gemini:     return "Gemini 5h"
+        case .thirdParty: return "Claude 5h"
+        }
+    }
+}
+
 struct QuotaSnapshot {
     let tool: ToolID
     let fetchedAt: Date
@@ -338,12 +353,94 @@ struct QuotaSnapshot {
         return .expired
     }
 
+    func antigravitySessionMetric(for pool: AntigravityQuotaPool) -> QuotaMetric? {
+        guard tool == .antigravity else { return nil }
+        let isSessionMetric: (QuotaMetric) -> Bool = { metric in
+            if metric.name.lowercased().contains("5h") { return true }
+            if let dur = metric.windowDurationSeconds, dur > 0, dur <= 6 * 3600 { return true }
+            return false
+        }
+        let matching = displayMetrics.first { metric in
+            guard isSessionMetric(metric) else { return false }
+            let lowerName = metric.name.lowercased()
+            let lowerDetail = metric.detail?.lowercased() ?? ""
+            switch pool {
+            case .gemini:
+                return lowerName == "gemini 5h" || (lowerDetail == "gemini" && lowerName.contains("5h"))
+            case .thirdParty:
+                return lowerName == "claude 5h" || lowerDetail.contains("claude") || lowerDetail.contains("gpt")
+            }
+        }
+        if let matching { return matching }
+        if displayMetrics.isEmpty, pool == .gemini {
+            return fiveHour
+        }
+        return nil
+    }
+
+    func antigravitySessionPools() -> [(pool: AntigravityQuotaPool, metric: QuotaMetric)] {
+        guard tool == .antigravity else { return [] }
+        return AntigravityQuotaPool.allCases.compactMap { pool in
+            antigravitySessionMetric(for: pool).map { (pool, $0) }
+        }
+    }
+
+    func antigravityWindowKey(for pool: AntigravityQuotaPool) -> String {
+        guard let metric = antigravitySessionMetric(for: pool) else {
+            return "\(primarySource)|\(pool.rawValue)|no-reset"
+        }
+        if metric.isIdleFiveHourWindow {
+            return "\(primarySource)|\(pool.rawValue)|idle"
+        }
+        let resetKey = metric.resetAt.map { ISO8601DateFormatter().string(from: $0) } ?? "no-reset"
+        return "\(primarySource)|\(pool.rawValue)|\(resetKey)"
+    }
+
+    /// Antigravity 5h pools that are currently unopened (`isIdleFiveHourWindow`)
+    /// and eligible for automatic warm-up without touching already-active pools.
+    func claimableAntigravityPools(
+        now: Date = Date(),
+        windowDuration: TimeInterval
+    ) -> [AntigravityQuotaPool] {
+        guard tool == .antigravity, freshness(now: now) == .fresh else { return [] }
+        let pools = antigravitySessionPools()
+        guard !pools.isEmpty else { return [] }
+        return pools.compactMap { entry in
+            entry.metric.isIdleFiveHourWindow ? entry.pool : nil
+        }
+    }
+
+    /// True when every targeted Antigravity 5h pool present in this fresh
+    /// snapshot is now active (no longer idle).
+    func showsActiveAntigravityPools(
+        _ pools: [AntigravityQuotaPool],
+        now: Date = Date()
+    ) -> Bool {
+        guard tool == .antigravity, freshness(now: now) == .fresh, !pools.isEmpty else {
+            return false
+        }
+        let present = pools.compactMap { pool -> QuotaMetric? in
+            antigravitySessionMetric(for: pool)
+        }
+        guard !present.isEmpty else {
+            return showsActiveWindow(now: now)
+        }
+        return present.allSatisfy { metric in
+            if metric.isIdleFiveHourWindow { return false }
+            if let resetAt = metric.resetAt { return resetAt > now }
+            return metric.remainingFraction >= 0.5
+        }
+    }
+
     func canAutoWarm(
         now: Date = Date(),
         windowDuration: TimeInterval,
         remainingThreshold: Double = 0.95,
         freshWindowGrace: TimeInterval = 10 * 60
     ) -> Bool {
+        if tool == .antigravity, !antigravitySessionPools().isEmpty {
+            return !claimableAntigravityPools(now: now, windowDuration: windowDuration).isEmpty
+        }
         guard freshness(now: now) == .fresh,
               let metric = fiveHour,
               let resetAt = metric.resetAt,

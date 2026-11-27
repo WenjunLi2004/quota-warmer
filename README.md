@@ -5,11 +5,12 @@
 A compact macOS menu bar app that keeps your Claude Code, Codex CLI, and Antigravity quota windows warm — it watches your rolling 5-hour windows and, when you ask it to, claims a fresh one the moment it opens instead of waiting for you to remember.
 
 <p align="center">
-  <img src="docs/images/panel-overview-light.png" alt="QuotaWarmer overview panel, light" width="360">
-  <img src="docs/images/panel-overview-dark.png" alt="QuotaWarmer overview panel, dark" width="360">
+  <img src="docs/images/panel-overview-light.png" alt="QuotaWarmer overview panel (light mode)" width="370">
+  &nbsp;&nbsp;
+  <img src="docs/images/panel-overview-dark.png" alt="QuotaWarmer Antigravity detail & token breakdown (dark mode)" width="370">
 </p>
 <p align="center">
-  <img src="docs/images/menu-bar.png" alt="QuotaWarmer menu bar readout" height="20">
+  <img src="docs/images/menu-bar.png" alt="QuotaWarmer menu bar readout" height="32">
 </p>
 
 By default it only **monitors**: it watches live quota snapshots and shows each provider's window in the menu bar. Switch a tool to **Auto-warm** and it also sends a minimal warm-up command through your own logged-in CLI the instant a fresh window opens, then verifies the window actually started. Any provider you aren't currently using (for example Claude Code) can be completely turned off and turned back on whenever you need it.
@@ -22,15 +23,15 @@ This is a personal fork of [bcanozgur/quota-warmer](https://github.com/bcanozgur
 
 - **Per-provider master toggle**: completely turn off any provider you aren't using right now (hiding it from the menu bar, sidebar, and overview and stopping all background checks), and turn it back on anytime with one click from Overview, Settings → Providers, or the menu bar right-click menu.
 - **Three modes per enabled tool**: **Off**, **Monitor only** (watch quota, never send anything — the default), or **Auto-warm** (claim fresh windows automatically).
-- **Menu bar status at a glance**: provider glyph, a clock-style countdown, and remaining quota percentage — quiet when healthy, a colored badge only when something needs attention.
-- **Claude Code, Codex CLI, and Antigravity support**: each provider is monitored, refreshed, and warmed independently.
+- **Menu bar status at a glance**: provider glyph, clock-style countdown, and remaining quota percentage (configurable display styles: both, percent only, or countdown only) — quiet when healthy, a colored badge only when something needs attention.
+- **Claude Code, Codex CLI, and Antigravity support**: each provider is monitored, refreshed, and warmed independently. Antigravity displays all four quota pools (**Gemini 5h**, **Gemini**, **Claude 5h**, **Claude**) and automatically claims unopened **Gemini 5h** and **Claude 5h** windows independently without touching already-active pools.
+- **Real token usage & breakdown**: cross-provider **Today's Tokens** summary on Overview plus per-tool **Today / Yesterday / Last 30 Days** real token counts, with clickable **Cache Read / Input / Output** and **Top Models** breakdowns (no fabricated subscription dollar estimates).
+- **Smart reset scheduling & guardrails**: accelerates polling right before a 5-hour window expires so fresh windows are claimed within seconds of rollover, plus optional **Active Hours** guards and once-per-window low-quota alerts.
 - **Resilient auto-warm**: if the live quota check is unavailable, auto-warm falls back to real local CLI activity on disk to decide whether a window needs claiming — a rate-limited status API no longer stalls the thing this app exists to do.
 - **Window claim receipt**: after a warm-up, QuotaWarmer re-checks quota to confirm the window actually opened, so "sent" never quietly means "missed."
 - **Liveness watchdog**: if the app ever stops checking quota, the menu bar and popover say so instead of looking healthy.
-- **Manual controls**: refresh quota or warm a provider directly from the popover.
-- **Lightweight history**: recent quota checks, warm-ups, claim confirmations, and failures are visible without leaving the menu.
-- **Morning pre-warm**: schedules the Mac to wake at a set time and claims the day's first window automatically, lid closed or not.
-- **Launch at login**: runs quietly as a menu bar utility, no Dock icon.
+- **Manual controls & lightweight history**: refresh quota, warm unopened windows directly from the popover, and inspect recent checks, warm-ups, claim confirmations, and failures without leaving the menu bar.
+- **Morning pre-warm & launch at login**: schedules the Mac to wake at a set time and claims the day's first window automatically, running quietly in the menu bar with no Dock icon.
 
 ## Is This Allowed?
 
@@ -45,18 +46,19 @@ QuotaWarmer runs quietly in the menu bar and periodically checks quota state for
 ```bash
 claude --model haiku --effort low --no-session-persistence --max-turns 1 --tools '' -p 'hi'
 codex exec -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral --ignore-rules 'hi'
-agy --effort low --print-timeout 45s -p 'hi'
+# Antigravity dynamically picks the lowest-cost live model from `agy models` for each unopened 5h pool (Gemini 5h / Claude 5h):
+agy --model '<lowest-cost-pool-model>' --print-timeout 45s -p 'hi'
 ```
 
-Codex and Antigravity run with whatever model your config defaults to, rather than a pinned one — a pinned model eventually gets retired (`gpt-5.4-mini` did for ChatGPT accounts, and `agy` headless mode exits non-zero on retired slugs). If ChatGPT.app is installed, its bundled `codex` is preferred over a global npm install, because an npm install doesn't update itself and older clients get refused for current models.
+Codex uses your configured default model rather than a pinned one, and Antigravity queries `agy models` dynamically (falling back to `agy --effort low --print-timeout 45s -p 'hi'` if needed) so retired model slugs never break warm-ups (`gpt-5.4-mini` was previously retired for ChatGPT accounts, and `agy` headless mode exits non-zero on retired slugs). If ChatGPT.app is installed, its bundled `codex` is preferred over a global npm install, because an npm install doesn't update itself and older clients get refused for current models.
 
-Local activity is read from:
+Local activity and token usage are read from:
 
 ```text
 ~/.claude/projects/*/*.jsonl
-~/.codex/sessions/YYYY/MM/DD/*.jsonl
-~/.gemini/antigravity-cli/conversations/*.db
-~/.gemini/antigravity/conversations/*.db
+~/.codex/sessions/YYYY/MM/DD/*.jsonl           # + archived_sessions/ & Codex analytics
+~/.gemini/antigravity*/conversations/*.db
+~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl
 ```
 
 These logs both give the UI display context and, since they reflect real usage rather than a network call, back up the auto-warm decision when the live API can't.

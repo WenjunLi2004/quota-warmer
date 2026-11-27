@@ -904,7 +904,9 @@ final class QuotaProvider: QuotaProviding {
         if let string = value as? String {
             let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
             if let iso = MetricExtractor.parseISODate(trimmed) {
-                return iso
+                // Antigravity returns protobuf's zero timestamp (`1970-01-01T00:00:00Z`)
+                // for buckets whose rolling window has not started yet.
+                return iso.timeIntervalSince1970 > 0 ? iso : nil
             }
             if let epoch = Double(trimmed), epoch > 0 {
                 return Date(timeIntervalSince1970: epoch > 10_000_000_000 ? epoch / 1000 : epoch)

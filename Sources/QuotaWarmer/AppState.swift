@@ -71,6 +71,9 @@ final class ToolState: ObservableObject {
     @Published var lastWarmupOutcome: WarmupOutcome = .none
     @Published var warmupLogs: [WarmupLog] = []
     @Published var isLogExpanded = false
+    var antigravityPoolWindowKeys: [AntigravityQuotaPool: String] = [:]
+    var antigravityPoolWarmEndsAt: [AntigravityQuotaPool: Date] = [:]
+    var lastWarmedAntigravityPools: [AntigravityQuotaPool] = []
     var quotaBackoffDelay: TimeInterval = 0
     var authRetryAttempts = 0
     var authRetryTask: Task<Void, Never>?
@@ -90,6 +93,23 @@ final class ToolState: ObservableObject {
                 self.lastAutoWarmWindowEndsAt = endsAt
             } else {
                 UserDefaults.standard.removeObject(forKey: "lastAutoWarmEndsAt.\(tool.rawValue)")
+            }
+        }
+        if tool == .antigravity {
+            for pool in AntigravityQuotaPool.allCases {
+                let keyName = "lastAutoWindowKey.antigravity.\(pool.rawValue)"
+                if let storedKey = UserDefaults.standard.string(forKey: keyName) {
+                    self.antigravityPoolWindowKeys[pool] = storedKey
+                }
+                let endsKey = "lastAutoWarmEndsAt.antigravity.\(pool.rawValue)"
+                if let storedEnds = UserDefaults.standard.object(forKey: endsKey) as? TimeInterval {
+                    let endsAt = Date(timeIntervalSince1970: storedEnds)
+                    if endsAt > Date() {
+                        self.antigravityPoolWarmEndsAt[pool] = endsAt
+                    } else {
+                        UserDefaults.standard.removeObject(forKey: endsKey)
+                    }
+                }
             }
         }
         if let storedReset = UserDefaults.standard.object(forKey: "confirmedWarmupResetAt.\(tool.rawValue)") as? TimeInterval {
@@ -171,6 +191,25 @@ final class ToolState: ObservableObject {
         return nil
     }
 
+    /// Soonest upcoming non-idle 5h reset across all pools (Antigravity tracks
+    /// Gemini 5h and Claude 5h independently, so either pool rolling over should
+    /// accelerate the next smart refresh).
+    var soonestActiveWindowResetAt: Date? {
+        if tool == .antigravity, let snapshot = quotaSnapshot {
+            let now = Date()
+            let activeResets = snapshot.antigravitySessionPools().compactMap { entry -> Date? in
+                guard !entry.metric.isIdleFiveHourWindow,
+                      let resetAt = entry.metric.resetAt,
+                      resetAt > now else { return nil }
+                return resetAt
+            }
+            if let soonest = activeResets.min() {
+                return soonest
+            }
+        }
+        return realWindowResetAt
+    }
+
     var timeUntilReset: TimeInterval? {
         guard let resetAt else { return nil }
         let remaining = resetAt.timeIntervalSinceNow
@@ -221,6 +260,34 @@ final class ToolState: ObservableObject {
         guard date > Date() else { return }
         lastAutoWarmWindowEndsAt = date
         UserDefaults.standard.set(date.timeIntervalSince1970, forKey: "lastAutoWarmEndsAt.\(tool.rawValue)")
+    }
+
+    func rememberAutoWindow(_ key: String, for pool: AntigravityQuotaPool) {
+        antigravityPoolWindowKeys[pool] = key
+        UserDefaults.standard.set(key, forKey: "lastAutoWindowKey.antigravity.\(pool.rawValue)")
+    }
+
+    func rememberAutoWarmWindowEnd(_ date: Date, for pool: AntigravityQuotaPool) {
+        guard date > Date() else { return }
+        antigravityPoolWarmEndsAt[pool] = date
+        UserDefaults.standard.set(date.timeIntervalSince1970, forKey: "lastAutoWarmEndsAt.antigravity.\(pool.rawValue)")
+    }
+
+    func eligibleAntigravityAutoWarmPools(
+        from snapshot: QuotaSnapshot,
+        now: Date = Date()
+    ) -> [AntigravityQuotaPool] {
+        let claimable = snapshot.claimableAntigravityPools(now: now, windowDuration: tool.windowDuration)
+        return claimable.filter { pool in
+            let metric = snapshot.antigravitySessionMetric(for: pool)
+            return AutoWarmDedup.shouldWarm(
+                currentWindowKey: snapshot.antigravityWindowKey(for: pool),
+                lastWarmedWindowKey: antigravityPoolWindowKeys[pool],
+                lastWarmedWindowEndsAt: antigravityPoolWarmEndsAt[pool],
+                currentWindowIsIdle: metric?.isIdleFiveHourWindow ?? true,
+                now: now
+            )
+        }
     }
 
     func rememberConfirmedWarmup(startedAt: Date, duration: TimeInterval) {
@@ -443,7 +510,26 @@ final class AppState: ObservableObject {
     }
 
     func activate(_ tool: ToolID) {
+        if tool == .antigravity {
+            Task {
+                let targetPools = self.manualAntigravityWarmupPools()
+                _ = await self.triggerAntigravityWarmup(pools: targetPools, mode: "manual")
+            }
+            return
+        }
         Task { await triggerWarmup(tool: tool, mode: "manual") }
+    }
+
+    /// Manual Warm on Antigravity opens any currently unopened 5h pool(s) without
+    /// wasting quota on already-active pools; if all pools are already active (or
+    /// no live snapshot exists yet), warms both pools so an explicit click always acts.
+    private func manualAntigravityWarmupPools() -> [AntigravityQuotaPool] {
+        let st = state(for: .antigravity)
+        if let snapshot = st.quotaSnapshot {
+            let unopened = snapshot.claimableAntigravityPools(windowDuration: ToolID.antigravity.windowDuration)
+            if !unopened.isEmpty { return unopened }
+        }
+        return AntigravityQuotaPool.allCases
     }
 
     func refreshAllActivity(allowAutomaticWarmup: Bool = false, includeInactive: Bool = false) {
@@ -622,6 +708,10 @@ final class AppState: ObservableObject {
         }
 
         guard scanner.windowStartTime(for: tool) == nil else { return }
+        if tool == .antigravity {
+            _ = await triggerAntigravityWarmup(pools: AntigravityQuotaPool.allCases, mode: "auto-catchup")
+            return
+        }
         _ = await triggerWarmup(tool: tool, mode: "auto-catchup")
     }
 
@@ -788,14 +878,25 @@ final class AppState: ObservableObject {
             guard canAttemptManagedWarmup(for: tool, ignoreActiveHours: true) else { continue }
 
             let previousQuotaFetchedAt = state(for: tool).quotaSnapshot?.fetchedAt
-            let succeeded = await triggerWarmup(
-                tool: tool,
-                mode: caughtUp ? "scheduled-catchup" : "scheduled"
-            )
-            if succeeded {
-                rememberMorningWarmSuccess(for: tool, dayKey: todayKey)
-                claimAutoWindowFromPostWarmQuota(for: tool, previousFetchedAt: previousQuotaFetchedAt)
-                caughtUpSuccessfully = caughtUpSuccessfully || caughtUp
+            let warmupMode = caughtUp ? "scheduled-catchup" : "scheduled"
+            if tool == .antigravity {
+                let targetPools = manualAntigravityWarmupPools()
+                let warmedPools = await triggerAntigravityWarmup(pools: targetPools, mode: warmupMode)
+                if !warmedPools.isEmpty {
+                    rememberMorningWarmSuccess(for: tool, dayKey: todayKey)
+                    claimAntigravityAutoWindows(for: warmedPools, previousFetchedAt: previousQuotaFetchedAt)
+                    caughtUpSuccessfully = caughtUpSuccessfully || caughtUp
+                }
+            } else {
+                let succeeded = await triggerWarmup(
+                    tool: tool,
+                    mode: warmupMode
+                )
+                if succeeded {
+                    rememberMorningWarmSuccess(for: tool, dayKey: todayKey)
+                    claimAutoWindowFromPostWarmQuota(for: tool, previousFetchedAt: previousQuotaFetchedAt)
+                    caughtUpSuccessfully = caughtUpSuccessfully || caughtUp
+                }
             }
         }
 
@@ -890,6 +991,26 @@ final class AppState: ObservableObject {
             // perfectly healthy window kept re-triggering warm-up attempts.
             return
         }
+
+        if tool == .antigravity, !snapshot.antigravitySessionPools().isEmpty {
+            let targetPools = state.eligibleAntigravityAutoWarmPools(from: snapshot)
+            guard !targetPools.isEmpty else {
+                let activeEnds = state.antigravityPoolWarmEndsAt.values.filter { $0 > Date() }.max()
+                if let endsAt = activeEnds {
+                    DiagnosticLogger.append("auto_warm_skipped_active_window tool=antigravity windowEndsAt=\(ISO8601DateFormatter().string(from: endsAt))")
+                }
+                return
+            }
+            let poolLabels = targetPools.map(\.displayName).joined(separator: ", ")
+            addHistory(tool: .antigravity, kind: .resetDetected, title: "Fresh reset detected", detail: "\(reason) (\(poolLabels))")
+            let previousFetchedAt = snapshot.fetchedAt
+            let warmedPools = await triggerAntigravityWarmup(pools: targetPools, mode: "auto")
+            if !warmedPools.isEmpty {
+                claimAntigravityAutoWindows(for: warmedPools, previousFetchedAt: previousFetchedAt)
+            }
+            return
+        }
+
         guard AutoWarmDedup.shouldWarm(
             currentWindowKey: snapshot.rawWindowKey,
             lastWarmedWindowKey: state.lastAutoWindowKey,
@@ -950,6 +1071,132 @@ final class AppState: ObservableObject {
             return
         }
         state.rememberAutoWindow(snapshot.rawWindowKey)
+    }
+
+    private func claimAntigravityAutoWindows(
+        for pools: [AntigravityQuotaPool],
+        previousFetchedAt: Date?
+    ) {
+        let state = state(for: .antigravity)
+        guard let snapshot = state.quotaSnapshot,
+              snapshot.isClaimableAutoWindow(previousFetchedAt: previousFetchedAt) else {
+            return
+        }
+        for pool in pools {
+            guard let metric = snapshot.antigravitySessionMetric(for: pool),
+                  !metric.isIdleFiveHourWindow else { continue }
+            state.rememberAutoWindow(snapshot.antigravityWindowKey(for: pool), for: pool)
+        }
+        if snapshot.fiveHour?.isIdle != true {
+            state.rememberAutoWindow(snapshot.rawWindowKey)
+        }
+    }
+
+    /// Warms one or more independent Antigravity 5h quota pools (`Gemini 5h`,
+    /// `Claude 5h`) sequentially and records per-pool dedup boundaries so an
+    /// already-open pool is never re-warmed when the other pool resets.
+    @discardableResult
+    private func triggerAntigravityWarmup(
+        pools: [AntigravityQuotaPool],
+        mode: String
+    ) async -> [AntigravityQuotaPool] {
+        let state = state(for: .antigravity)
+        guard state.isEnabled, !state.isWarming, !pools.isEmpty else { return [] }
+
+        state.isWarming = true
+        state.errorMessage = nil
+        state.claimVerifyTask?.cancel(); state.claimVerifyTask = nil
+        state.settleRepollTask?.cancel(); state.settleRepollTask = nil
+        notifications.cancelAll(for: .antigravity)
+
+        let results = await runner.warmupAntigravity(pools: pools)
+        var succeededPools: [AntigravityQuotaPool] = []
+        var failedDetails: [String] = []
+        var authFailureMessage: String?
+        var latestSuccessDate = Date()
+
+        for entry in results {
+            switch entry.result {
+            case .success(let runResult):
+                succeededPools.append(entry.pool)
+                latestSuccessDate = runResult.date
+                let logEntry = WarmupLog(
+                    timestamp: runResult.date,
+                    mode: "\(mode) · \(entry.pool.displayName)",
+                    command: runResult.command,
+                    output: runResult.output
+                )
+                state.warmupLogs.insert(logEntry, at: 0)
+                if state.warmupLogs.count > 20 { state.warmupLogs.removeLast() }
+            case .failure(let error):
+                if case WarmupError.authenticationRequired(let msg) = error {
+                    authFailureMessage = msg
+                }
+                failedDetails.append("\(entry.pool.displayName): \(error.localizedDescription)")
+            }
+        }
+
+        if let authMessage = authFailureMessage, succeededPools.isEmpty {
+            state.errorMessage = authMessage
+            state.healthMessage = authMessage
+            state.sourceHealth = .authFailure
+            state.authStatus = .failed
+            state.backoffUntil = nil
+            state.lastWarmupOutcome = .failed(at: Date(), reason: authMessage)
+            addHistory(tool: .antigravity, kind: .authFailure, title: "Warmup blocked", detail: authMessage)
+            state.isWarming = false
+            return []
+        }
+
+        if succeededPools.isEmpty {
+            let reason = failedDetails.isEmpty ? "Antigravity warmup failed" : failedDetails.joined(separator: "; ")
+            state.errorMessage = reason
+            state.backoffUntil = Date().addingTimeInterval(nextBackoff(for: state))
+            state.lastWarmupOutcome = .failed(at: Date(), reason: reason)
+            addHistory(tool: .antigravity, kind: .pollingError, title: "Warmup failed", detail: reason)
+            state.isWarming = false
+            return []
+        }
+
+        state.backoffUntil = nil
+        state.lastWarmedAntigravityPools = succeededPools
+        let warmedNames = succeededPools.map(\.displayName).joined(separator: ", ")
+        var detail = "Warmed \(warmedNames)"
+        if !failedDetails.isEmpty {
+            detail += " (partial: \(failedDetails.joined(separator: "; ")))"
+            state.errorMessage = failedDetails.joined(separator: "; ")
+        }
+        addHistory(
+            tool: .antigravity,
+            kind: historyKind(forWarmupMode: mode),
+            title: historyTitle(forWarmupMode: mode),
+            detail: detail
+        )
+        notifications.notifyWarmupCommandSent(tool: .antigravity)
+        state.lastWarmupOutcome = .pending(sentAt: latestSuccessDate)
+
+        await refreshQuota(
+            for: .antigravity,
+            allowAutomaticWarmup: false,
+            allowsClaudeCLIRecovery: false
+        )
+
+        let fallbackEnd = latestSuccessDate.addingTimeInterval(ToolID.antigravity.windowDuration)
+        for pool in succeededPools {
+            let liveReset = state.quotaSnapshot?.antigravitySessionMetric(for: pool).flatMap { metric in
+                metric.isIdleFiveHourWindow ? nil : metric.resetAt
+            }
+            state.rememberAutoWarmWindowEnd(liveReset ?? fallbackEnd, for: pool)
+        }
+        let liveMetric = state.primaryMetric
+        if liveMetric?.resetAt == nil || liveMetric?.isIdle == true {
+            state.rememberConfirmedWarmup(startedAt: latestSuccessDate, duration: ToolID.antigravity.windowDuration)
+        }
+        state.rememberAutoWarmWindowEnd(state.resetAt ?? fallbackEnd)
+        evaluateWarmupClaim(for: .antigravity, sentAt: latestSuccessDate, attempt: 0)
+
+        state.isWarming = false
+        return succeededPools
     }
 
     private func refreshQuotaForAutomaticDecision(tool: ToolID) async {
@@ -1029,12 +1276,20 @@ final class AppState: ObservableObject {
     /// to tolerate provider lag before falling back to the assumed window. Bounded.
     private let claimVerifyDelays: [TimeInterval] = [30, 90]
 
+    private func isWarmupClaimConfirmed(for state: ToolState) -> Bool {
+        guard let snapshot = state.quotaSnapshot else { return false }
+        if state.tool == .antigravity, !state.lastWarmedAntigravityPools.isEmpty {
+            return snapshot.showsActiveAntigravityPools(state.lastWarmedAntigravityPools)
+        }
+        return snapshot.showsActiveWindow()
+    }
+
     /// Evaluates the live (post-warm) snapshot: marks the window confirmed, or
     /// schedules a bounded grace re-check, or — once attempts are exhausted —
     /// confirms against the completed command's expected (assumed) window.
     private func evaluateWarmupClaim(for tool: ToolID, sentAt: Date, attempt: Int) {
         let state = state(for: tool)
-        if state.quotaSnapshot?.showsActiveWindow() == true {
+        if isWarmupClaimConfirmed(for: state) {
             state.claimVerifyTask?.cancel(); state.claimVerifyTask = nil
             state.lastWarmupOutcome = .confirmed(at: Date(), resetAt: state.resetAt)
             addHistory(tool: tool, kind: .resetDetected, title: "Window claim confirmed", detail: claimConfirmedDetail(state))
@@ -1087,7 +1342,7 @@ final class AppState: ObservableObject {
     private func reconcileWarmupOutcome(for state: ToolState) {
         switch state.lastWarmupOutcome {
         case .pending(let sentAt):
-            if state.quotaSnapshot?.showsActiveWindow() == true {
+            if isWarmupClaimConfirmed(for: state) {
                 state.claimVerifyTask?.cancel(); state.claimVerifyTask = nil
                 state.lastWarmupOutcome = .confirmed(at: Date(), resetAt: state.resetAt)
                 addHistory(tool: state.tool, kind: .resetDetected, title: "Window claim confirmed", detail: claimConfirmedDetail(state))
@@ -1101,7 +1356,7 @@ final class AppState: ObservableObject {
             // "Window claimed at …" card so it doesn't keep implying an active
             // window hours after that window expired.
             if let resetAt, resetAt <= Date(),
-               state.quotaSnapshot?.showsActiveWindow() != true {
+               !isWarmupClaimConfirmed(for: state) {
                 state.lastWarmupOutcome = .none
             }
         default:
@@ -1403,7 +1658,7 @@ final class AppState: ObservableObject {
         var nextDate = SmartRefreshPolicy.nextRefreshDate(
             now: now,
             refreshInterval: refreshInterval,
-            windowResetAt: state.realWindowResetAt
+            windowResetAt: state.soonestActiveWindowResetAt
         )
         if activeHoursEnabled,
            state.isAutoWarmEnabled,

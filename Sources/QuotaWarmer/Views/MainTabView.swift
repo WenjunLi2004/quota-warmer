@@ -37,7 +37,7 @@ struct MainTabView: View {
                         .foregroundStyle(DS.C.textMuted)
                 }
                 Spacer(minLength: 6)
-                Text(TokenFormatting.costAndTokens(costUSD: summary.totalCostUSD, tokens: summary.totalTokens))
+                Text(TokenFormatting.tokensLabel(summary.totalTokens))
                     .font(DS.mono(11.5, weight: .semibold))
                     .foregroundStyle(DS.C.text)
                     .lineLimit(1)
@@ -75,7 +75,7 @@ struct MainTabView: View {
                                 .foregroundStyle(DS.C.textSub)
                                 .lineLimit(1)
                             Spacer(minLength: 6)
-                            Text(entry.day == nil ? "--" : TokenFormatting.costAndTokens(costUSD: entry.costUSD, tokens: entry.tokens))
+                            Text(entry.day == nil ? "--" : TokenFormatting.tokensLabel(entry.tokens))
                                 .font(DS.mono(10.5, weight: .semibold))
                                 .foregroundStyle(entry.day == nil ? DS.C.textMuted : DS.C.text)
                                 .lineLimit(1)

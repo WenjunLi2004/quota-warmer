@@ -5,11 +5,12 @@
 一个小巧的 macOS 菜单栏应用,帮你把 Claude Code、Codex CLI 和 Antigravity 的 5 小时配额窗口一直"焐热"——它盯着你的滚动配额窗口,窗口一开就自动接手续上,不用你自己记着去用一下才能触发。
 
 <p align="center">
-  <img src="docs/images/panel-overview-light.png" alt="QuotaWarmer 总览面板,浅色" width="360">
-  <img src="docs/images/panel-overview-dark.png" alt="QuotaWarmer 总览面板,深色" width="360">
+  <img src="docs/images/panel-overview-light.png" alt="QuotaWarmer 总览面板（浅色）" width="370">
+  &nbsp;&nbsp;
+  <img src="docs/images/panel-overview-dark.png" alt="QuotaWarmer Antigravity 详情与 Token 明细（深色）" width="370">
 </p>
 <p align="center">
-  <img src="docs/images/menu-bar.png" alt="QuotaWarmer 菜单栏显示" height="20">
+  <img src="docs/images/menu-bar.png" alt="QuotaWarmer 菜单栏显示" height="32">
 </p>
 
 默认只**监控**:实时看配额、在菜单栏显示每个工具的窗口状态。把某个工具切到 **Auto-warm**,它就会在窗口一开的瞬间,通过你本机已登录的 CLI 发一条最小化的预热命令,然后再确认一遍窗口是不是真的开了。暂时不用的工具(例如 Claude Code)可以随时主动一键关闭,需要时再一键重新打开。
@@ -22,15 +23,15 @@
 
 - **每个工具独立总开关**:暂时不用的工具(如 Claude)可在总览卡片右上角电源按钮、工具详情页、Settings → Providers 或菜单栏右键菜单中一键关闭(从菜单栏、侧边栏和总览隐藏并彻底停止轮询/预热),需要时一键重新打开。
 - **已启用工具三档模式**:**Off**(暂停监控)、**Monitor only**(只看不发,默认档)、**Auto-warm**(自动抢开新窗口)。
-- **菜单栏一眼看懂状态**:工具图标、时钟式倒计时、剩余配额百分比——健康时安安静静,只有真需要注意时才会亮起彩色角标。
-- **同时支持 Claude Code、Codex CLI 和 Antigravity**:三个工具各自独立监控、刷新、预热。
+- **菜单栏一眼看懂状态**:工具图标、时钟式倒计时、剩余配额百分比(支持在设置中切换同时显示/仅百分比/仅倒计时)——健康时安安静静,只有真需要注意时才会亮起彩色角标。
+- **同时支持 Claude Code、Codex CLI 和 Antigravity**:三个工具各自独立监控、刷新、预热;Antigravity 完整展示 **Gemini 5h / Gemini / Claude 5h / Claude** 四个配额池,并按需分别预热未开窗的 **Gemini 5h** 与 **Claude 5h**（已开窗的池子自动跳过,不浪费额度）。
+- **真实 Token 用量与明细**:总览页提供跨工具 **Today's Tokens** 汇总卡片,各工具详情页展示 **Today / Yesterday / Last 30 Days** 真实 Token 计数,点击任意时间段即可展开 **Cache Read / Input / Output** 与 **Top Models** 占比明细（不展示虚构的订阅折算美元金额）。
+- **智能重置调度与防护**:5 小时窗口临近重置时自动提前刷新以第一时间抢开新窗口,并支持**活跃时段护栏（Active Hours）**与低配额提醒。
 - **抗限流的自动续期**:实时配额查不到时,会退而求其次去看本地 CLI 的真实活动记录来判断要不要续窗口——配额查询接口被限流,不再连累这个 app 真正该干的事。
 - **开窗回执**:预热之后会再查一次配额,确认窗口真的开了,不会出现"命令发了但其实没生效"这种情况自己却不知道。
 - **健康监测**:如果 app 哪天真的停止检查配额了,菜单栏和面板会明说,而不是继续装作一切正常。
-- **手动控制**:面板里可以直接手动刷新配额或手动预热某个工具。
-- **轻量历史记录**:最近的配额检查、预热、开窗确认、失败记录,不用离开菜单栏就能看。
-- **早晨预热**:可以设定一个时间让 Mac 自动唤醒并抢开当天第一个窗口,合不合盖都不影响。
-- **开机自启**:安静地作为菜单栏工具运行,没有 Dock 图标。
+- **手动控制与轻量历史记录**:面板里可直接手动刷新或预热未开窗配额池,并随时查看最近的配额检查、预热、开窗确认与失败记录。
+- **早晨预热与开机自启**:设定时间让 Mac 自动唤醒并抢开当天第一个窗口,安静地驻留在菜单栏,无 Dock 图标。
 
 ## 这样用合规吗?
 
@@ -45,18 +46,19 @@ QuotaWarmer 安安静静地跑在菜单栏,定期检查已启用工具的配额�
 ```bash
 claude --model haiku --effort low --no-session-persistence --max-turns 1 --tools '' -p 'hi'
 codex exec -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral --ignore-rules 'hi'
-agy --effort low --print-timeout 45s -p 'hi'
+# Antigravity 通过 `agy models` 动态为每个未开窗的 5h 配额池（Gemini 5h / Claude 5h）选择最低成本模型:
+agy --model '<lowest-cost-pool-model>' --print-timeout 45s -p 'hi'
 ```
 
-Codex 和 Antigravity 用的都是你本地配置里的默认模型,不写死某一个——写死的模型迟早会被下线(ChatGPT 账号下的 `gpt-5.4-mini` 就是这样,`agy` 的无头模式遇到已下线模型名也会直接报错退出)。装了 ChatGPT.app 的话,优先用它内置的 `codex`,而不是 npm 全局装的那个:npm 装的不会自己更新,旧客户端会被服务端拒绝使用当前的模型。
+Codex 使用你本地配置里的默认模型,Antigravity 则通过 `agy models` 动态发现可用模型（若失败再回退 `agy --effort low --print-timeout 45s -p 'hi'`）,不写死易淘汰的模型名（ChatGPT 账号下的 `gpt-5.4-mini` 曾因下线失效,`agy` 无头模式遇到已下线模型名也会直接报错退出）。装了 ChatGPT.app 的话,优先用它内置的 `codex`,而不是 npm 全局装的那个:npm 装的不会自己更新,旧客户端会被服务端拒绝使用当前的模型。
 
-本地活动读取自:
+本地活动与 Token 用量读取自:
 
 ```text
 ~/.claude/projects/*/*.jsonl
-~/.codex/sessions/YYYY/MM/DD/*.jsonl
-~/.gemini/antigravity-cli/conversations/*.db
-~/.gemini/antigravity/conversations/*.db
+~/.codex/sessions/YYYY/MM/DD/*.jsonl           # 同时兼容 archived_sessions/ 与 Codex 远程统计
+~/.gemini/antigravity*/conversations/*.db
+~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl
 ```
 
 这些日志一方面给界面提供上下文,另一方面——因为它们反映的是真实使用情况而不是一次网络请求——在实时接口失灵的时候,能撑住自动续期的判断。

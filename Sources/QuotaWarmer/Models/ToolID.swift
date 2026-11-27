@@ -152,9 +152,27 @@ enum ToolID: String, CaseIterable, Identifiable, Codable {
             return [
                 geminiRoot.appendingPathComponent("antigravity-cli/conversations"),
                 geminiRoot.appendingPathComponent("antigravity/conversations"),
+                geminiRoot.appendingPathComponent("antigravity-ide/conversations"),
                 tokscaleRoot.appendingPathComponent("antigravity-cache/sessions")
             ]
         }
+    }
+
+    /// Antigravity brain directories storing per-conversation transcripts at
+    /// `<conversation-id>/.system_generated/logs/transcript.jsonl`.
+    var antigravityBrainDirectoryURLs: [URL] {
+        guard self == .antigravity else { return [] }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let geminiHome = ProcessInfo.processInfo.environment["GEMINI_CLI_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let geminiRoot = (geminiHome?.isEmpty == false)
+            ? URL(fileURLWithPath: geminiHome!)
+            : home.appendingPathComponent(".gemini")
+        return [
+            geminiRoot.appendingPathComponent("antigravity/brain"),
+            geminiRoot.appendingPathComponent("antigravity-cli/brain"),
+            geminiRoot.appendingPathComponent("antigravity-ide/brain")
+        ]
     }
 
     /// Rolling quota window duration. Claude Code, Codex, and Antigravity use

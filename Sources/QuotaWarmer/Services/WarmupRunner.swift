@@ -11,6 +11,7 @@ import Glibc
 enum WarmupError: LocalizedError {
     case cliNotFound(String)
     case authenticationRequired(String)
+    case modelUnavailable(String)
     case exitCode(Int32)
     case timeout
     case workspaceUnavailable
@@ -19,6 +20,7 @@ enum WarmupError: LocalizedError {
         switch self {
         case .cliNotFound(let cmd): return "CLI not found: \(cmd)"
         case .authenticationRequired(let message): return message
+        case .modelUnavailable(let message): return message
         case .exitCode(let code):   return "Process exited with code \(code)"
         case .timeout:              return "Warmup timed out after 60s"
         case .workspaceUnavailable: return "Could not prepare isolated warmup directory"
@@ -30,6 +32,12 @@ struct WarmupResult {
     let date: Date
     let command: String
     let output: String
+}
+
+struct AntigravityPoolWarmupResult {
+    let pool: AntigravityQuotaPool
+    let modelSlug: String?
+    let result: Result<WarmupResult, Error>
 }
 
 enum CLIAuthenticationStatus: Equatable {
@@ -86,6 +94,249 @@ class WarmupRunner {
                 output: "Primary warmup command failed; retried with the configured fallback command.\n\(result.output)"
             )
         }
+    }
+
+    /// Warms one or more independent Antigravity 5h quota pools (`Gemini 5h`, `Claude 5h`)
+    /// sequentially using dynamically discovered lowest-cost model slugs from `agy models`.
+    func warmupAntigravity(pools: [AntigravityQuotaPool]) async -> [AntigravityPoolWarmupResult] {
+        guard !pools.isEmpty else { return [] }
+        guard let cliURL = await resolveCLI(named: "agy") else {
+            return pools.map {
+                AntigravityPoolWarmupResult(pool: $0, modelSlug: nil, result: .failure(WarmupError.cliNotFound("agy")))
+            }
+        }
+        let pathPrefix = cliURL.deletingLastPathComponent().path
+        let workspaceURL: URL
+        do {
+            workspaceURL = try warmupWorkspaceURL()
+        } catch {
+            return pools.map {
+                AntigravityPoolWarmupResult(pool: $0, modelSlug: nil, result: .failure(error))
+            }
+        }
+
+        let discoveredModels: [String]
+        do {
+            discoveredModels = try await discoverAntigravityModels(cliURL: cliURL)
+        } catch let authErr as WarmupError {
+            if case .authenticationRequired = authErr {
+                return pools.map {
+                    AntigravityPoolWarmupResult(pool: $0, modelSlug: nil, result: .failure(authErr))
+                }
+            }
+            discoveredModels = []
+        } catch {
+            discoveredModels = []
+        }
+
+        var results: [AntigravityPoolWarmupResult] = []
+        for pool in pools {
+            let primarySlug = Self.selectAntigravityWarmupModel(for: pool, availableModels: discoveredModels)
+            do {
+                let (usedSlug, runResult) = try await warmupSingleAntigravityPool(
+                    pool: pool,
+                    primarySlug: primarySlug,
+                    availableModels: discoveredModels,
+                    cliURL: cliURL,
+                    pathPrefix: pathPrefix,
+                    workspaceURL: workspaceURL
+                )
+                results.append(AntigravityPoolWarmupResult(pool: pool, modelSlug: usedSlug, result: .success(runResult)))
+            } catch let authErr as WarmupError {
+                results.append(AntigravityPoolWarmupResult(pool: pool, modelSlug: primarySlug, result: .failure(authErr)))
+                if case .authenticationRequired = authErr {
+                    break
+                }
+            } catch {
+                results.append(AntigravityPoolWarmupResult(pool: pool, modelSlug: primarySlug, result: .failure(error)))
+            }
+        }
+        return results
+    }
+
+    private func warmupSingleAntigravityPool(
+        pool: AntigravityQuotaPool,
+        primarySlug: String?,
+        availableModels: [String],
+        cliURL: URL,
+        pathPrefix: String,
+        workspaceURL: URL
+    ) async throws -> (String?, WarmupResult) {
+        if let slug = primarySlug {
+            let cmd = Self.substitutingResolvedBinary(
+                Self.antigravityWarmupCommand(modelSlug: slug),
+                cliName: "agy",
+                resolvedPath: cliURL.path
+            )
+            do {
+                let res = try await runWarmupCommand(cmd, cliName: "agy", pathPrefix: pathPrefix, workspaceURL: workspaceURL)
+                return (slug, res)
+            } catch WarmupError.exitCode {
+                await AntigravityModelCatalogCache.shared.invalidate(for: cliURL.path)
+                // Retry once: for 3P try an alternate 3P model if present (or retry the same slug once after a short pause
+                // for transient loadCodeAssist EOFs); for Gemini fall back to the default command.
+                if pool == .thirdParty {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    let retrySlug = Self.selectAntigravityWarmupModel(
+                        for: .thirdParty,
+                        availableModels: availableModels,
+                        excluding: [slug]
+                    ) ?? slug
+                    let retryCmd = Self.substitutingResolvedBinary(
+                        Self.antigravityWarmupCommand(modelSlug: retrySlug),
+                        cliName: "agy",
+                        resolvedPath: cliURL.path
+                    )
+                    let res = try await runWarmupCommand(retryCmd, cliName: "agy", pathPrefix: pathPrefix, workspaceURL: workspaceURL)
+                    return (retrySlug, res)
+                }
+                let fallback = try await runDefaultAntigravityWarmup(cliURL: cliURL, pathPrefix: pathPrefix, workspaceURL: workspaceURL)
+                return (nil, fallback)
+            }
+        }
+
+        if pool == .gemini {
+            let res = try await runDefaultAntigravityWarmup(cliURL: cliURL, pathPrefix: pathPrefix, workspaceURL: workspaceURL)
+            return (nil, res)
+        }
+        throw WarmupError.modelUnavailable("No Claude or GPT model found in `agy models`")
+    }
+
+    private func runDefaultAntigravityWarmup(
+        cliURL: URL,
+        pathPrefix: String,
+        workspaceURL: URL
+    ) async throws -> WarmupResult {
+        let primaryCommand = Self.substitutingResolvedBinary(ToolID.antigravity.warmupCommand, cliName: "agy", resolvedPath: cliURL.path)
+        do {
+            return try await runWarmupCommand(primaryCommand, cliName: "agy", pathPrefix: pathPrefix, workspaceURL: workspaceURL)
+        } catch WarmupError.exitCode where ToolID.antigravity.fallbackWarmupCommand != nil {
+            let fallbackCommand = Self.substitutingResolvedBinary(ToolID.antigravity.fallbackWarmupCommand!, cliName: "agy", resolvedPath: cliURL.path)
+            let result = try await runWarmupCommand(fallbackCommand, cliName: "agy", pathPrefix: pathPrefix, workspaceURL: workspaceURL)
+            return WarmupResult(
+                date: result.date,
+                command: result.command,
+                output: "Primary warmup command failed; retried with the configured fallback command.\n\(result.output)"
+            )
+        }
+    }
+
+    private func discoverAntigravityModels(cliURL: URL) async throws -> [String] {
+        if let cached = await AntigravityModelCatalogCache.shared.cachedModels(for: cliURL.path) {
+            return cached
+        }
+        let result = await runDirectCommand(
+            executableURL: cliURL,
+            arguments: ["models"],
+            extraEnvironment: [
+                "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
+                "BROWSER": "/usr/bin/false"
+            ],
+            pathPrefix: cliURL.deletingLastPathComponent().path,
+            cliName: "agy",
+            timeout: 20
+        )
+        let combined = "\(result.stdout)\n\(result.stderr)"
+        if result.exitCode != 0, Self.isAntigravityAuthenticationFailure(combined) {
+            throw WarmupError.authenticationRequired(Self.antigravityLoginRequiredMessage)
+        }
+        let parsed = Self.parseAntigravityModels(result.stdout)
+        if !parsed.isEmpty {
+            await AntigravityModelCatalogCache.shared.store(models: parsed, for: cliURL.path)
+        }
+        return parsed
+    }
+
+    static func antigravityWarmupCommand(modelSlug: String) -> String {
+        let escaped = modelSlug.replacingOccurrences(of: "'", with: "'\\''")
+        return "agy --model '\(escaped)' --print-timeout 45s -p 'hi'"
+    }
+
+    static func parseAntigravityModels(_ output: String) -> [String] {
+        // Strip ANSI escape codes and split on CR/LF (spinner updates use \r).
+        let stripped = output.replacingOccurrences(
+            of: #"\u{001B}\[[0-9;]*[A-Za-z]"#,
+            with: "",
+            options: .regularExpression
+        )
+        var seen = Set<String>()
+        var slugs: [String] = []
+        for rawLine in stripped.components(separatedBy: CharacterSet.newlines) {
+            let segments = rawLine.components(separatedBy: "\r")
+            guard let lastSegment = segments.last else { continue }
+            let trimmed = lastSegment.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            guard let firstToken = trimmed.split(whereSeparator: \.isWhitespace).first else { continue }
+            let slug = String(firstToken)
+            guard slug.contains("-"),
+                  slug.range(of: #"^[a-z0-9][a-z0-9._-]*$"#, options: .regularExpression) != nil else {
+                continue
+            }
+            if seen.insert(slug).inserted {
+                slugs.append(slug)
+            }
+        }
+        return slugs
+    }
+
+    static func selectAntigravityWarmupModel(
+        for pool: AntigravityQuotaPool,
+        availableModels: [String],
+        excluding: Set<String> = []
+    ) -> String? {
+        var bestSlug: String?
+        var bestScore = Int.min
+
+        for slug in availableModels where !excluding.contains(slug) {
+            let lower = slug.lowercased()
+            if lower.hasPrefix("tab_") || lower.contains("autocomplete") || lower.contains("image") || lower.contains("lite") {
+                continue
+            }
+            let score: Int?
+            switch pool {
+            case .gemini:
+                guard lower.contains("gemini"), !lower.contains("claude"), !lower.contains("gpt") else {
+                    score = nil
+                    break
+                }
+                var s = 0
+                // Avoid versioned/orchestrator pools (e.g. Argon) so warmup hits the primary Gemini 5h pool.
+                if !lower.contains("argon") && !lower.contains("orchestrator") { s += 1000 }
+                if lower.contains("flash") { s += 200 }
+                if lower.hasSuffix("-low") || lower.hasSuffix("_low") {
+                    s += 50
+                } else if lower.hasSuffix("-medium") || lower.hasSuffix("_medium") {
+                    s += 20
+                }
+                if lower.contains("carbon") || lower.contains("hydrogen") { s += 10 }
+                score = s
+            case .thirdParty:
+                guard lower.contains("claude") || lower.contains("gpt") else {
+                    score = nil
+                    break
+                }
+                var s = 0
+                if lower.contains("claude") {
+                    s += 500
+                    if lower.contains("haiku") { s += 300 }
+                    else if lower.contains("sonnet") { s += 200 }
+                    else if lower.contains("opus") { s += 50 }
+                } else if lower.contains("gpt-oss") {
+                    s += 100
+                }
+                if lower.hasSuffix("-low") || lower.hasSuffix("_low") {
+                    s += 50
+                } else if lower.hasSuffix("-medium") || lower.hasSuffix("_medium") {
+                    s += 20
+                }
+                score = s
+            }
+            if let score, score > bestScore {
+                bestScore = score
+                bestSlug = slug
+            }
+        }
+        return bestSlug
     }
 
     private static func substitutingResolvedBinary(_ command: String, cliName: String, resolvedPath: String) -> String {
@@ -717,5 +968,33 @@ private final class SinglePipeCollector: @unchecked Sendable {
         }
         return (String(data: buffer, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+private actor AntigravityModelCatalogCache {
+    static let shared = AntigravityModelCatalogCache()
+
+    private struct Entry {
+        let fetchedAt: Date
+        let models: [String]
+    }
+
+    private let ttlSeconds: TimeInterval = 30 * 60
+    private var entries: [String: Entry] = [:]
+
+    func cachedModels(for cliPath: String, now: Date = Date()) -> [String]? {
+        guard let entry = entries[cliPath],
+              now.timeIntervalSince(entry.fetchedAt) < ttlSeconds else {
+            return nil
+        }
+        return entry.models
+    }
+
+    func store(models: [String], for cliPath: String, now: Date = Date()) {
+        entries[cliPath] = Entry(fetchedAt: now, models: models)
+    }
+
+    func invalidate(for cliPath: String) {
+        entries.removeValue(forKey: cliPath)
     }
 }

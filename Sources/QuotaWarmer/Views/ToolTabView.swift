@@ -172,7 +172,7 @@ struct ToolTabView: View {
             Divider()
                 .overlay(DS.C.borderSoft)
             HStack(spacing: 6) {
-                Text("Token Spend")
+                Text("Token Usage")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DS.C.textMuted)
                 Spacer(minLength: 8)
@@ -249,7 +249,7 @@ struct ToolTabView: View {
 
     private func tokenUsageValue(_ usage: TokenUsageDay?) -> String {
         guard let usage else { return "--" }
-        return "\(TokenFormatting.cost(usage.costUSD)) · \(TokenFormatting.tokensLabel(usage.totalTokens))"
+        return TokenFormatting.tokensLabel(usage.totalTokens)
     }
 
     private func fallbackResetText(metric: QuotaMetric?) -> String {

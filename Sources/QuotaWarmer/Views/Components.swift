@@ -457,11 +457,6 @@ struct TokenBreakdownCard: View {
                 Text(title)
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(DS.C.textSub)
-                if let costUSD = day.costUSD, day.totalTokens > 0 {
-                    Text(TokenFormatting.cost(costUSD))
-                        .font(DS.mono(10.5, weight: .medium))
-                        .foregroundStyle(DS.C.textMuted)
-                }
                 Spacer(minLength: 6)
                 Button(action: copyBreakdown) {
                     Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
@@ -585,9 +580,6 @@ struct TokenBreakdownCard: View {
         var lines: [String] = [
             "\(title): \(TokenFormatting.tokensLabel(day.totalTokens))"
         ]
-        if let costUSD = day.costUSD, day.totalTokens > 0 {
-            lines.append("Est. API Cost: \(TokenFormatting.cost(costUSD))")
-        }
         lines.append("Cache Read: \(TokenFormatting.shortNumber(day.cachedInputTokens)) · Input: \(TokenFormatting.shortNumber(day.uncachedInputTokens)) · Output: \(TokenFormatting.shortNumber(day.outputTokens))")
         if !day.topModels.isEmpty {
             let modelsText = day.topModels

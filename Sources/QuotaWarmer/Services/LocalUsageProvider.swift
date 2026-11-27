@@ -409,7 +409,10 @@ final class LocalUsageProvider {
         case .antigravity:
             let roots = (baseURL.map { [$0] } ?? tool.activityDirectoryURLs)
                 .filter { fileManager.fileExists(atPath: $0.path) }
-            buckets = roots.isEmpty ? [:] : antigravityBuckets(in: roots, since: since)
+            let brainRoots = antigravityBrainRoots(baseURL: baseURL)
+            buckets = (roots.isEmpty && brainRoots.isEmpty)
+                ? [:]
+                : antigravityBuckets(in: roots, brainRoots: brainRoots, since: since)
         }
 
         let todayBucket = buckets[today] ?? UsageBucket()
@@ -822,38 +825,94 @@ final class LocalUsageProvider {
         return false
     }
 
-    private func antigravityBuckets(in roots: [URL], since: Date) -> [Date: UsageBucket] {
+    private func antigravityBrainRoots(baseURL: URL?) -> [URL] {
+        if let baseURL {
+            return [
+                baseURL,
+                baseURL.appendingPathComponent("brain", isDirectory: true)
+            ].filter { fileManager.fileExists(atPath: $0.path) }
+        }
+        return ToolID.antigravity.antigravityBrainDirectoryURLs
+            .filter { fileManager.fileExists(atPath: $0.path) }
+    }
+
+    private func antigravityBuckets(in roots: [URL], brainRoots: [URL], since: Date) -> [Date: UsageBucket] {
         var recordsByID: [String: UsageRecord] = [:]
         var seenFiles = Set<String>()
-        for root in roots {
-            enumerateJSONL(in: root, since: since) { url in
-                let canonical = url.resolvingSymlinksInPath().path
-                guard seenFiles.insert(canonical).inserted else { return }
-                guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-                var currentModel: String?
-                let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-                for (index, line) in lines.enumerated() {
-                    guard let object = jsonObject(String(line)) else { continue }
-                    if let initObj = object["init"] as? [String: Any],
-                       let initModel = stringValue(initObj["model"]) {
-                        currentModel = initModel
-                    }
-                    currentModel = model(from: object) ?? currentModel
-                    // Skip terminal `result` envelopes when `step_update` lines already
-                    // supplied per-step usage, or dedupe by conversation/line identity.
-                    let fallbackDate = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                    guard let recordDate = date(from: object) ?? fallbackDate,
-                          recordDate >= since,
-                          let record = antigravityRecord(from: object, date: recordDate, model: currentModel) else {
-                        continue
-                    }
-                    let id = antigravityIdentity(from: object, url: url, lineIndex: index)
-                    if let existing = recordsByID[id], existing.totalTokens >= record.totalTokens { continue }
-                    recordsByID[id] = record
+
+        let parseFile: (URL) -> Void = { url in
+            let canonical = url.resolvingSymlinksInPath().path
+            guard seenFiles.insert(canonical).inserted else { return }
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+            var currentModel: String?
+            let fallbackDate = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+            for (index, line) in lines.enumerated() {
+                guard let object = self.jsonObject(String(line)) else { continue }
+                if let initObj = object["init"] as? [String: Any],
+                   let initModel = self.stringValue(initObj["model"]) {
+                    currentModel = initModel
                 }
+                currentModel = self.model(from: object) ?? currentModel
+                // Skip terminal `result` envelopes when `step_update` lines already
+                // supplied per-step usage, or dedupe by conversation/line identity.
+                guard let recordDate = self.date(from: object) ?? fallbackDate,
+                      recordDate >= since,
+                      let record = self.antigravityRecord(from: object, date: recordDate, model: currentModel) else {
+                    continue
+                }
+                let id = self.antigravityIdentity(from: object, url: url, lineIndex: index)
+                if let existing = recordsByID[id], existing.totalTokens >= record.totalTokens { continue }
+                recordsByID[id] = record
             }
         }
+
+        for brainRoot in brainRoots {
+            enumerateAntigravityBrainTranscripts(in: brainRoot, since: since, handler: parseFile)
+        }
+        for root in roots {
+            enumerateJSONL(in: root, since: since, handler: parseFile)
+        }
         return buckets(from: Array(recordsByID.values), pricing: antigravityCost)
+    }
+
+    /// Scans `<brainRoot>/<conversation-id>/.system_generated/logs/transcript.jsonl`
+    /// (falling back to `transcript_full.jsonl` only when the compact transcript is absent).
+    /// `FileManager.enumerator` with `.skipsHiddenFiles` skips `.system_generated`, and a
+    /// blind hidden-file walk would also double-count `transcript_full.jsonl` and `chunks/`.
+    private func enumerateAntigravityBrainTranscripts(
+        in brainRoot: URL,
+        since: Date,
+        handler: (URL) -> Void
+    ) {
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: brainRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for convDir in children {
+            guard convDir.lastPathComponent != "tempmediaStorage",
+                  (try? convDir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else {
+                continue
+            }
+            let logsDir = convDir.appendingPathComponent(".system_generated/logs", isDirectory: true)
+            let compactURL = logsDir.appendingPathComponent("transcript.jsonl")
+            let fullURL = logsDir.appendingPathComponent("transcript_full.jsonl")
+            let candidateURL: URL
+            if fileManager.fileExists(atPath: compactURL.path) {
+                candidateURL = compactURL
+            } else if fileManager.fileExists(atPath: fullURL.path) {
+                candidateURL = fullURL
+            } else {
+                continue
+            }
+            if let mtime = (try? candidateURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+               mtime < since {
+                continue
+            }
+            handler(candidateURL)
+        }
     }
 
     private func antigravityIdentity(from object: [String: Any], url: URL, lineIndex: Int) -> String {
@@ -867,6 +926,16 @@ final class LocalUsageProvider {
         if let sessionId = stringValue(object["sessionId"]),
            let ts = stringValue(object["timestamp"]) {
             return "session:\(sessionId)#\(ts)"
+        }
+        let logsDir = url.deletingLastPathComponent()
+        let sysDir = logsDir.deletingLastPathComponent()
+        if logsDir.lastPathComponent == "logs",
+           sysDir.lastPathComponent == ".system_generated",
+           object["step_index"] != nil {
+            let convID = sysDir.deletingLastPathComponent().lastPathComponent
+            let stepIdx = intValue(object["step_index"])
+            let created = stringValue(object["created_at"]) ?? String(lineIndex)
+            return "transcript:\(convID)#\(stepIdx)#\(created)"
         }
         return "\(url.path)#\(lineIndex)"
     }
@@ -882,7 +951,16 @@ final class LocalUsageProvider {
             usage = stepUsage
         } else if let directUsage = object["usage"] as? [String: Any] {
             usage = directUsage
-        } else if object["inputTokens"] != nil || object["outputTokens"] != nil || object["totalTokens"] != nil {
+        } else if object["input_tokens"] != nil
+            || object["output_tokens"] != nil
+            || object["cache_read_tokens"] != nil
+            || object["thinking_tokens"] != nil
+            || object["total_tokens"] != nil
+            || object["inputTokens"] != nil
+            || object["outputTokens"] != nil
+            || object["cacheReadTokens"] != nil
+            || object["thinkingTokens"] != nil
+            || object["totalTokens"] != nil {
             usage = object
         } else {
             usage = nil
@@ -890,24 +968,45 @@ final class LocalUsageProvider {
         guard let usage else { return nil }
 
         let input = intValue(usage["input_tokens"] ?? usage["inputTokens"])
-        let cacheRead = intValue(usage["cache_read_tokens"] ?? usage["cacheReadTokens"] ?? usage["cachedInputTokens"])
+        let cacheWrite = intValue(
+            usage["cache_creation_tokens"]
+                ?? usage["cache_creation_input_tokens"]
+                ?? usage["cacheWriteTokens"]
+                ?? usage["cacheCreationTokens"]
+        )
+        let cacheRead = intValue(
+            usage["cache_read_tokens"]
+                ?? usage["cache_read_input_tokens"]
+                ?? usage["cacheReadTokens"]
+                ?? usage["cachedInputTokens"]
+        )
         let output = intValue(usage["output_tokens"] ?? usage["outputTokens"])
         let thinking = intValue(usage["thinking_tokens"] ?? usage["thinkingTokens"] ?? usage["thinkingOutputTokens"])
         let explicitTotal = intValue(usage["total_tokens"] ?? usage["totalTokens"])
         let combinedOutput = output > 0 ? output : thinking
-        let resolvedTotal = explicitTotal > 0 ? explicitTotal : (input + cacheRead + combinedOutput)
+        let resolvedTotal = explicitTotal > 0 ? explicitTotal : (input + cacheWrite + cacheRead + combinedOutput)
         guard resolvedTotal > 0 else { return nil }
 
-        let inputIncludesCache = explicitTotal > 0 && input >= cacheRead
-        let uncachedIn = inputIncludesCache ? max(0, input - cacheRead) : input
+        // In Antigravity `transcript.jsonl`, `input_tokens` is uncached input (`explicitTotal == 0`).
+        // In CLI `usage` envelopes with `total_tokens`, `input_tokens` may already include `cache_read_tokens`
+        // (`input + output == total_tokens`). Compare both sums against `explicitTotal` to disambiguate.
+        let inputIncludesCache: Bool
+        if explicitTotal > 0 && cacheRead > 0 && input >= cacheRead {
+            let totalIfIncludes = input + cacheWrite + combinedOutput
+            let totalIfExcludes = input + cacheWrite + cacheRead + combinedOutput
+            inputIncludesCache = abs(totalIfIncludes - explicitTotal) < abs(totalIfExcludes - explicitTotal)
+        } else {
+            inputIncludesCache = false
+        }
+        let uncachedOnly = inputIncludesCache ? max(0, input - cacheRead) : input
 
         return UsageRecord(
             date: date,
             model: model,
-            inputTokens: input,
-            uncachedInput: uncachedIn,
+            inputTokens: uncachedOnly,
+            uncachedInput: uncachedOnly + cacheWrite,
             cachedInput: cacheRead,
-            cacheCreationFiveMinuteTokens: 0,
+            cacheCreationFiveMinuteTokens: cacheWrite,
             cacheCreationOneHourTokens: 0,
             cacheReadTokens: cacheRead,
             cachedInputTokens: cacheRead,
@@ -923,11 +1022,24 @@ final class LocalUsageProvider {
             return claudeCost(record)
         }
         if text.contains("gpt-") {
-            return codexCost(record)
+            if let tier = codexPricingTier(for: record.model) {
+                let totalInput = record.uncachedInput + record.cachedInput
+                let isLongContext = tier.longContextThreshold.map { totalInput > $0 } ?? false
+                let inRate = isLongContext ? (tier.inputAboveThreshold ?? tier.input) : tier.input
+                let cacheRate = isLongContext ? (tier.cacheReadAboveThreshold ?? tier.cacheRead) : tier.cacheRead
+                let outRate = isLongContext ? (tier.outputAboveThreshold ?? tier.output) : tier.output
+                return ((Double(record.uncachedInput) * inRate)
+                    + (Double(record.cachedInput) * cacheRate)
+                    + (Double(record.outputTokens) * outRate)) / 1_000_000
+            }
+            if text.contains("gpt-oss") {
+                return ((Double(record.uncachedInput) * 0.15)
+                    + (Double(record.cachedInput) * 0.075)
+                    + (Double(record.outputTokens) * 0.60)) / 1_000_000
+            }
         }
         let rates = antigravityRates(for: record.model)
-        let uncachedInput = max(0, record.inputTokens - record.cacheReadTokens)
-        return ((Double(uncachedInput) * rates.input)
+        return ((Double(record.uncachedInput) * rates.input)
             + (Double(record.cacheReadTokens) * rates.cacheRead)
             + (Double(record.outputTokens) * rates.output)) / 1_000_000
     }
@@ -1146,8 +1258,13 @@ final class LocalUsageProvider {
     }
 
     private func usesModernOpusPricing(_ model: String) -> Bool {
-        ["4-5", "4.5", "4_5", "4-6", "4.6", "4_6", "4-7", "4.7", "4_7", "4-8", "4.8", "4_8", "latest"]
-            .contains { model.contains($0) }
+        if [
+            "4-5", "4.5", "4_5", "4-6", "4.6", "4_6", "4-7", "4.7", "4_7",
+            "4-8", "4.8", "4_8", "4-9", "4.9", "4_9", "latest"
+        ].contains(where: { model.contains($0) }) {
+            return true
+        }
+        return model.range(of: #"opus-[5-9]|-[5-9]([._-]|$)"#, options: .regularExpression) != nil
     }
 
     private func usageObject(from object: [String: Any]) -> [String: Any]? {
@@ -1209,7 +1326,13 @@ final class LocalUsageProvider {
     }
 
     private func date(from object: [String: Any]) -> Date? {
-        if let value = stringValue(object["timestamp"]) {
+        if let value = stringValue(object["timestamp"])
+            ?? stringValue(object["created_at"])
+            ?? stringValue(object["createdAt"]) {
+            return parseDate(value)
+        }
+        if let step = object["step_update"] as? [String: Any],
+           let value = stringValue(step["timestamp"]) ?? stringValue(step["created_at"]) {
             return parseDate(value)
         }
         if let envelope = claudeEnvelopeObject(from: object),

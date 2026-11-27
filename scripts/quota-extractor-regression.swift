@@ -1358,6 +1358,90 @@ struct QuotaExtractorRegression {
                 "Interactive login prompt must classify as Antigravity auth failure")
         require(WarmupRunner.isAntigravityAuthenticationFailure("Error: authentication required; run agy to sign in"),
                 "Headless auth error must classify as Antigravity auth failure")
+
+        // 6. Epoch-zero (`1970-01-01T00:00:00Z`) unopened 3p-5h/3p-weekly sentinel + selective dual-pool claiming.
+        let mixedEpochZeroPayload: [String: Any] = [
+            "groups": [
+                [
+                    "name": "Gemini Models",
+                    "buckets": [
+                        ["id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.9985, "reset_time": formatter.string(from: geminiWeeklyReset)],
+                        ["id": "gemini-5h", "window": "5h", "remaining_fraction": 0.9985, "reset_time": formatter.string(from: now.addingTimeInterval(5 * 3600 - 60))]
+                    ]
+                ],
+                [
+                    "name": "Claude and GPT models",
+                    "buckets": [
+                        ["id": "3p-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": "1970-01-01T00:00:00Z"],
+                        ["id": "3p-5h", "window": "5h", "remaining_fraction": 1.0, "reset_time": "1970-01-01T00:00:00Z"]
+                    ]
+                ]
+            ]
+        ]
+        let mixedSnap = provider.antigravitySnapshot(
+            payload: mixedEpochZeroPayload,
+            source: "Antigravity CLI usage",
+            message: "agy CLI",
+            now: now
+        )
+        let mixedGemini5h = mixedSnap.antigravitySessionMetric(for: .gemini)
+        let mixedClaude5h = mixedSnap.antigravitySessionMetric(for: .thirdParty)
+        let mixedClaudeWeekly = mixedSnap.displayMetrics.first { $0.name == "Claude" }
+        require(mixedGemini5h?.isIdle == false, "Active Gemini 5h must not be flagged idle")
+        require(mixedClaude5h?.isIdle == true && mixedClaude5h?.isIdleFiveHourWindow == true,
+                "Epoch-zero 1970-01-01 3p-5h bucket must be treated as unopened idle window (Not started yet)")
+        require(mixedClaudeWeekly?.resetAt == nil,
+                "Epoch-zero 1970-01-01 3p-weekly bucket must drop sentinel resetAt instead of storing 1970")
+        require(mixedSnap.claimableAntigravityPools(now: now, windowDuration: ToolID.antigravity.windowDuration) == [.thirdParty],
+                "When Gemini 5h is active and Claude 5h is idle, only Claude 5h (.thirdParty) must be claimed")
+        require(mixedSnap.canAutoWarm(now: now, windowDuration: ToolID.antigravity.windowDuration),
+                "Antigravity snapshot must allow auto-warm when Claude 5h is unopened even if Gemini 5h is active")
+        require(mixedSnap.showsActiveAntigravityPools([.gemini], now: now)
+                && !mixedSnap.showsActiveAntigravityPools([.thirdParty], now: now)
+                && !mixedSnap.showsActiveAntigravityPools([.gemini, .thirdParty], now: now),
+                "showsActiveAntigravityPools must require every targeted pool to be active")
+
+        let bothIdlePayload: [String: Any] = [
+            "groups": [
+                [
+                    "name": "Gemini Models",
+                    "buckets": [
+                        ["id": "gemini-5h", "window": "5h", "remaining_fraction": 1.0, "reset_time": "1970-01-01T00:00:00Z"]
+                    ]
+                ],
+                [
+                    "name": "Claude and GPT models",
+                    "buckets": [
+                        ["id": "3p-5h", "window": "5h", "remaining_fraction": 1.0, "reset_time": "1970-01-01T00:00:00Z"]
+                    ]
+                ]
+            ]
+        ]
+        let bothIdleSnap = provider.antigravitySnapshot(payload: bothIdlePayload, source: "test", message: nil, now: now)
+        require(bothIdleSnap.claimableAntigravityPools(now: now, windowDuration: ToolID.antigravity.windowDuration) == [.gemini, .thirdParty],
+                "Both unopened Antigravity 5h pools must be claimable")
+
+        // 7. Dynamic `agy models` parsing and lowest-cost per-pool model selection.
+        let sampleModelsOutput = """
+        \r⠋ Fetching available models...\rgemini-4-neon-high             Gemini 4 Neon (High)
+        gemini-4-argon-low             Gemini 4 Argon (Low)
+        gemini-pro-orchestrator-neon   Orchestrator (Neon)
+        gemini-3.8-flash-high          Gemini 3.8 Flash (High)
+        gemini-3.8-flash-low           Gemini 3.8 Flash (Low)
+        claude-opus-5-5-low            Claude Opus 5.5 (Low)
+        claude-sonnet-5-5-medium       Claude Sonnet 5.5 (Medium)
+        claude-sonnet-5-5-low          Claude Sonnet 5.5 (Low)
+        gpt-oss-120b-medium            GPT-OSS 120B (Medium)
+        """
+        let parsedModels = WarmupRunner.parseAntigravityModels(sampleModelsOutput)
+        require(parsedModels.contains("gemini-4-neon-high") && parsedModels.contains("claude-sonnet-5-5-low"),
+                "parseAntigravityModels must strip spinner carriage returns and extract model slugs")
+        require(WarmupRunner.selectAntigravityWarmupModel(for: .gemini, availableModels: parsedModels) == "gemini-3.8-flash-low",
+                "Gemini 5h warmup must pick lowest-cost primary Gemini flash-low model (avoiding Argon/Orchestrator)")
+        require(WarmupRunner.selectAntigravityWarmupModel(for: .thirdParty, availableModels: parsedModels) == "claude-sonnet-5-5-low",
+                "Claude 5h warmup must pick lowest-cost Claude Sonnet low model")
+        require(WarmupRunner.selectAntigravityWarmupModel(for: .thirdParty, availableModels: parsedModels, excluding: ["claude-sonnet-5-5-low"]) == "claude-sonnet-5-5-medium",
+                "Claude 5h retry must select the next-best Claude model")
     }
 
     private static func testAntigravityLocalUsageAndActivity() {
@@ -1382,6 +1466,61 @@ struct QuotaExtractorRegression {
         requireClose(summary.today.costUSD, 0.00158, "Antigravity Gemini Flash pricing")
         // Neon: (1000 * 2.00 + 200 * 12.00) / 1e6 = 0.0044
         requireClose(summary.yesterday.costUSD, 0.0044, "Antigravity Gemini Neon pricing")
+
+        // Antigravity 2.0 / IDE / CLI brain transcript layout:
+        // `<appDataDir>/brain/<conv-id>/.system_generated/logs/transcript.jsonl`
+        // (hidden `.system_generated` folder, top-level snake_case token fields, `created_at` timestamps,
+        // co-located `transcript_full.jsonl` & `chunks/` that must NOT double-count, `transcript_full.jsonl`
+        // fallback when compact `transcript.jsonl` is absent, uncached `input_tokens < cache_read_tokens`,
+        // and modern `claude-opus-5-5-high` pricing).
+        let appDataDir = temporaryDirectory("antigravity-app-data")
+        defer { try? FileManager.default.removeItem(at: appDataDir) }
+        let conv1Logs = appDataDir
+            .appendingPathComponent("brain/conv-carbon-and-opus/.system_generated/logs", isDirectory: true)
+        let conv1Chunks = conv1Logs.appendingPathComponent("chunks", isDirectory: true)
+        let conv2Logs = appDataDir
+            .appendingPathComponent("brain/conv-full-only/.system_generated/logs", isDirectory: true)
+        let tempMedia = appDataDir.appendingPathComponent("brain/tempmediaStorage", isDirectory: true)
+        createDirectory(conv1Chunks)
+        createDirectory(conv2Logs)
+        createDirectory(tempMedia)
+
+        let conv1Lines = [
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-15T08:00:00Z","content":"hello"}"#,
+            // input_tokens (2,000) < cache_read_tokens (80,000): proves input_tokens is already uncached!
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-15T08:00:05Z","model":"gemini-4-carbon-high","input_tokens":2000,"cache_read_tokens":80000,"output_tokens":1000}"#,
+            #"{"step_index":2,"source":"SYSTEM","type":"GENERIC","status":"DONE","created_at":"2026-06-15T08:00:06Z","content":"tool result","truncated_fields":["content"]}"#,
+            // Rewound step with same step_index (1) at a later created_at using claude-opus-5-5-high:
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-15T08:05:00Z","model":"claude-opus-5-5-high","input_tokens":4000,"cache_read_tokens":10000,"output_tokens":600}"#
+        ]
+        writeJSONL(conv1Lines, to: conv1Logs.appendingPathComponent("transcript.jsonl"))
+        writeJSONL(conv1Lines, to: conv1Logs.appendingPathComponent("transcript_full.jsonl"))
+        writeJSONL(conv1Lines, to: conv1Chunks.appendingPathComponent("0001.jsonl"))
+
+        // Second conversation only has transcript_full.jsonl, with yesterday's `created_at` (must bucket to yesterday, not file mtime today).
+        writeJSONL([
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-14T20:00:00Z","model":"gemini-3.8-flash-high","input_tokens":1000,"cache_read_tokens":2000,"output_tokens":400}"#
+        ], to: conv2Logs.appendingPathComponent("transcript_full.jsonl"))
+
+        let brainSummary = usageProvider.usage(for: .antigravity, baseURL: appDataDir, now: now)
+        require(brainSummary.today.totalTokens == 97_600,
+                "Antigravity brain transcript today tokens should equal 97,600 without double-counting transcript_full/chunks, got \(brainSummary.today.totalTokens)")
+        require(brainSummary.today.uncachedInputTokens == 6_000,
+                "Antigravity brain transcript uncachedInputTokens should equal 6,000 (not subtracted by cache_read_tokens), got \(brainSummary.today.uncachedInputTokens)")
+        require(brainSummary.today.cachedInputTokens == 90_000,
+                "Antigravity brain transcript cachedInputTokens should equal 90,000, got \(brainSummary.today.cachedInputTokens)")
+        require(brainSummary.today.outputTokens == 1_600,
+                "Antigravity brain transcript outputTokens should equal 1,600, got \(brainSummary.today.outputTokens)")
+        // Carbon: (2000*1.25 + 80000*0.125 + 1000*10.0)/1e6 = 0.0225
+        // Opus 5.5: (4000*5.0 + 10000*0.50 + 600*25.0)/1e6 = 0.0400 -> sum = 0.0625
+        requireClose(brainSummary.today.costUSD, 0.0625, "Antigravity Carbon + modern Opus 5.5 pricing")
+        require(brainSummary.yesterday.totalTokens == 3_400,
+                "Antigravity transcript_full fallback should bucket by created_at (yesterday = 3,400), got \(brainSummary.yesterday.totalTokens)")
+        requireClose(brainSummary.yesterday.costUSD, 0.00136, "Antigravity yesterday Flash transcript pricing")
+        require(brainSummary.last30Days.totalTokens == 101_000,
+                "Antigravity brain 30-day total should equal 101,000, got \(brainSummary.last30Days.totalTokens)")
+        require(brainSummary.today.topModels.map(\.model) == ["gemini-4-carbon-high", "claude-opus-5-5-high"],
+                "Antigravity topModels should rank Carbon (83K) ahead of Opus 5.5 (14.6K)")
 
         // ActivityScanner must ignore `conversation_summaries.db` and detect real `.db` conversations.
         let convDir = temporaryDirectory("antigravity-conversations")
@@ -1514,6 +1653,40 @@ struct QuotaExtractorRegression {
         } catch {
             fatalError("Expected WarmupError.authenticationRequired for signed-out agy, got \(error)")
         }
+
+        // Phase 3: Dual-pool warmupAntigravity(pools: [.gemini, .thirdParty]) via `agy models` + `--model <slug>`.
+        let dualPoolAgy = dir.appendingPathComponent("agy-dual-pool")
+        let dualPoolLog = dir.appendingPathComponent("dual-pool.log")
+        let dualPoolScript = """
+        #!/bin/sh
+        if [ "$1" = "models" ]; then
+          echo "gemini-4-argon-low             Gemini 4 Argon (Low)"
+          echo "gemini-3.8-flash-low           Gemini 3.8 Flash (Low)"
+          echo "claude-opus-5-5-high           Claude Opus 5.5 (High)"
+          echo "claude-sonnet-5-5-low          Claude Sonnet 5.5 (Low)"
+          exit 0
+        fi
+        echo "args:$*" >> "\(dualPoolLog.path)"
+        echo "hi!"
+        exit 0
+        """
+        try! dualPoolScript.write(to: dualPoolAgy, atomically: true, encoding: .utf8)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dualPoolAgy.path)
+        setenv("ANTIGRAVITY_CLI_PATH", dualPoolAgy.path, 1)
+
+        let dualResults = await WarmupRunner().warmupAntigravity(pools: [.gemini, .thirdParty])
+        require(dualResults.count == 2, "Dual-pool warmup must return one result per requested pool")
+        for entry in dualResults {
+            if case .failure(let err) = entry.result {
+                fatalError("Dual-pool warmup failed unexpectedly for \(entry.pool): \(err)")
+            }
+        }
+        let dualInvocations = (try? String(contentsOf: dualPoolLog, encoding: .utf8)) ?? ""
+        require(
+            dualInvocations.contains("--model gemini-3.8-flash-low")
+                && dualInvocations.contains("--model claude-sonnet-5-5-low"),
+            "Dual-pool warmup must invoke agy with lowest-cost model per pool, got:\n\(dualInvocations)"
+        )
     }
 
     private static func testSmartSchedulingAndAlertPolicies() {
@@ -1745,6 +1918,13 @@ struct QuotaExtractorRegression {
         require(
             toolViewSource.contains("displayMetrics") && toolViewSource.contains("TokenBreakdownCard"),
             "ToolTabView must render Antigravity 4-bar displayMetrics and OpenUsage-style TokenBreakdownCard"
+        )
+        let componentsSource = readSource("Sources/QuotaWarmer/Views/Components.swift")
+        require(
+            !mainViewSource.contains("costAndTokens")
+                && !toolViewSource.contains("TokenFormatting.cost")
+                && !componentsSource.contains("Est. API Cost:"),
+            "Token usage UI must show pure token counts and breakdowns without simulated dollar amounts"
         )
 
         // 3. Codex `wham/analytics/daily-workspace-usage-counts` parser matches OpenUsage 0.8+ exactly.
